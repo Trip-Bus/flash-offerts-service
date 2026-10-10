@@ -2,6 +2,7 @@ package com.tripbus.flashoffers.client;
 
 import com.tripbus.flashoffers.common.error.ApiException;
 import com.tripbus.flashoffers.config.OffersProperties;
+import com.tripbus.flashoffers.config.RequestIdPropagationInterceptor;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.HttpClientErrorException;
@@ -21,7 +22,11 @@ public class CatalogClient {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(1000);
         factory.setReadTimeout(3000);
-        this.restClient = RestClient.builder().baseUrl(properties.catalogUrl()).requestFactory(factory).build();
+        this.restClient = RestClient.builder()
+                .baseUrl(properties.catalogUrl())
+                .requestFactory(factory)
+                .requestInterceptor(new RequestIdPropagationInterceptor())
+                .build();
     }
 
     public record Itinerary(UUID itineraryId, UUID companyId, BigDecimal precioBase, String estado,
