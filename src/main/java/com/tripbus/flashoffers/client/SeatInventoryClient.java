@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tripbus.flashoffers.common.error.ApiException;
 import com.tripbus.flashoffers.config.OffersProperties;
+import com.tripbus.flashoffers.config.RequestIdPropagationInterceptor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -33,6 +34,7 @@ public class SeatInventoryClient {
                 .baseUrl(properties.seatInventoryUrl())
                 .requestFactory(factory)
                 .defaultHeader("X-Internal-Token", token)
+                .requestInterceptor(new RequestIdPropagationInterceptor())
                 .build();
     }
 

@@ -31,6 +31,10 @@ public class SecurityConfig {
                         .requestMatchers("/internal/**").hasRole(InternalTokenFilter.INTERNAL_ROLE)
                         // Ver ofertas, su cupo y tiempo restante no requiere cuenta.
                         .requestMatchers(HttpMethod.GET, "/offers", "/offers/**").permitAll()
+                        // Swagger (en prod springdoc está apagado y estas rutas dan 404) y página de error.
+                        .requestMatchers(HttpMethod.GET, "/v3/api-docs/**", "/swagger-ui/**",
+                                "/swagger-ui.html").permitAll()
+                        .requestMatchers("/error").permitAll()
                         .anyRequest().authenticated())
                 .oauth2ResourceServer(o -> o
                         .jwt(j -> j.jwtAuthenticationConverter(new JwtRoleConverter()))
