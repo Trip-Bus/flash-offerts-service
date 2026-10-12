@@ -18,6 +18,8 @@ import java.util.UUID;
 public class OfferScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(OfferScheduler.class);
+    /** Un borrador vive lo que tarda reserveOfferSeats (máx. ~6 s); pasado esto se da por abandonado. */
+    static final Duration DRAFT_TTL = Duration.ofMinutes(5);
 
     private final OfferRepository offerRepository;
     private final OfferService offerService;
@@ -39,6 +41,7 @@ public class OfferScheduler {
 
     public void runNow() {
         var now = clock.instant();
+        // Ni la activación ni el cierre incluyen BORRADOR: un borrador aún no tiene asientos reservados.
         for (UUID id : offerRepository.findIdsToActivate(OfferStatus.PROGRAMADA, now)) {
             try {
                 offerService.activate(id);
@@ -54,6 +57,15 @@ public class OfferScheduler {
                 log.info("Oferta {} cerrada por horario", id);
             } catch (RuntimeException e) {
                 log.warn("No se pudo cerrar la oferta {}: {}", id, e.getMessage());
+            }
+        }
+        // Borradores abandonados (caída a mitad de create o compensación fallida): se liberan sus asientos.
+        for (UUID id : offerRepository.findIdsByEstadoCreatedBefore(OfferStatus.BORRADOR, now.minus(DRAFT_TTL))) {
+            try {
+                offerService.purgeStaleDraft(id);
+                log.info("Borrador de oferta {} descartado", id);
+            } catch (RuntimeException e) {
+                log.warn("No se pudo descartar el borrador {}: {}", id, e.getMessage());
             }
         }
     }

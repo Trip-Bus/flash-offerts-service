@@ -26,7 +26,10 @@ public interface OfferRepository extends JpaRepository<Offer, UUID> {
     @Query("select o.id from Offer o where o.estado in :estados and o.fin <= :now")
     List<UUID> findIdsToClose(@Param("estados") Collection<OfferStatus> estados, @Param("now") Instant now);
 
-    List<Offer> findByItineraryIdOrderByInicioDesc(UUID itineraryId);
+    List<Offer> findByItineraryIdAndEstadoNotOrderByInicioDesc(UUID itineraryId, OfferStatus estado);
+
+    @Query("select o.id from Offer o where o.estado = :estado and o.creadoEn < :limite")
+    List<UUID> findIdsByEstadoCreatedBefore(@Param("estado") OfferStatus estado, @Param("limite") Instant limite);
 
     List<Offer> findByEstadoInOrderByInicioAsc(Collection<OfferStatus> estados);
 
