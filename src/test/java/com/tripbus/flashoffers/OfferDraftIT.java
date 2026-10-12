@@ -19,12 +19,14 @@ import org.springframework.boot.testcontainers.service.connection.ServiceConnect
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.math.BigDecimal;
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
@@ -40,6 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
@@ -75,6 +78,8 @@ class OfferDraftIT {
     private QuotaCounter quotaCounter;
     @Autowired
     private JdbcTemplate jdbc;
+    @Autowired
+    private TransactionTemplate tx;
 
     @MockitoBean
     private SeatInventoryClient seatInventory;
@@ -82,12 +87,14 @@ class OfferDraftIT {
     private CatalogClient catalog;
 
     private final UUID companyId = UUID.randomUUID();
-    private final UUID itineraryId = UUID.randomUUID();
     private final AtomicReference<UUID> offerId = new AtomicReference<>();
+    // Un viaje por prueba: así list(itineraryId) y onItineraryCancelled no ven ofertas de otras pruebas.
+    private UUID itineraryId;
 
     @BeforeEach
     void simular() {
         offerId.set(null);
+        itineraryId = UUID.randomUUID();
         when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId, companyId,
                 new BigDecimal("95000"), "PROGRAMADO", Instant.now().plus(2, ChronoUnit.DAYS)));
     }
@@ -101,6 +108,18 @@ class OfferDraftIT {
     private String estado(UUID id) {
         List<String> estados = jdbc.queryForList("select estado from offers where id = ?", String.class, id);
         return estados.isEmpty() ? null : estados.get(0);
+    }
+
+    private Offer borrador(Instant creadoEn) {
+        Instant now = Instant.now();
+        return offerRepository.save(new Offer(itineraryId, new BigDecimal("49900"), 2, now,
+                now.plus(1, ChronoUnit.HOURS), UUID.randomUUID(), creadoEn));
+    }
+
+    private void reservaConAsientos() {
+        when(seatInventory.reserveOfferSeats(any(), any(), anyList())).thenAnswer(inv ->
+                new SeatInventoryClient.OfferSeats(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                        List.of()));
     }
 
     @Test
@@ -213,5 +232,113 @@ class OfferDraftIT {
 
         assertThat(estado(viejo.getId())).isEqualTo("BORRADOR");
         offerRepository.deleteById(viejo.getId());
+    }
+
+    @Test
+    void unaRespuestaSinListaDeAsientosCuentaComoSinAsientos() {
+        // Seat Inventory responde sin cuerpo (null) o con "reservados": null.
+        when(seatInventory.reserveOfferSeats(any(), any(), anyList()))
+                .thenAnswer(inv -> {
+                    offerId.set(inv.getArgument(0));
+                    return null;
+                })
+                .thenAnswer(inv -> {
+                    offerId.set(inv.getArgument(0));
+                    return new SeatInventoryClient.OfferSeats(inv.getArgument(0), inv.getArgument(1), null, null);
+                });
+
+        for (int i = 0; i < 2; i++) {
+            assertThatThrownBy(this::crear).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+            verify(seatInventory).releaseOfferSeats(offerId.get());
+            assertThat(estado(offerId.get())).isNull();
+        }
+    }
+
+    @Test
+    void siElBorradorDesaparecioDuranteLaReservaSeLiberanLosAsientos() {
+        // La limpieza (u otro nodo) borró el borrador mientras Seat Inventory reservaba: no se puede programar.
+        when(seatInventory.reserveOfferSeats(any(), any(), anyList())).thenAnswer(inv -> {
+            offerId.set(inv.getArgument(0));
+            jdbc.update("delete from offers where id = ?", (UUID) inv.getArgument(0));
+            return new SeatInventoryClient.OfferSeats(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                    List.of());
+        });
+
+        assertThatThrownBy(this::crear).extracting("code").isEqualTo("OFFER_DRAFT_EXPIRED");
+        verify(seatInventory).releaseOfferSeats(offerId.get());
+        assertThat(estado(offerId.get())).isNull();
+    }
+
+    @Test
+    void siNoSePuedeBorrarElBorradorSeConservaElErrorOriginalYLoRecogeLaLimpieza() {
+        // Una fila que referencia al borrador (FK) hace fallar su borrado durante la compensación.
+        when(seatInventory.reserveOfferSeats(any(), any(), anyList())).thenAnswer(inv -> {
+            UUID id = inv.getArgument(0);
+            offerId.set(id);
+            jdbc.update("insert into offer_sales (id, offer_id, user_id, doc_id, seat_number, estado, creado_en, "
+                    + "actualizado_en) values (?, ?, ?, 'CC1', '1', 'LIBERADA', now(), now())",
+                    UUID.randomUUID(), id, UUID.randomUUID());
+            throw ApiException.unavailable("SEAT_INVENTORY_UNAVAILABLE", "timeout");
+        });
+
+        assertThatThrownBy(this::crear).extracting("code").isEqualTo("SEAT_INVENTORY_UNAVAILABLE");
+        UUID id = offerId.get();
+        verify(seatInventory).releaseOfferSeats(id);
+        assertThat(estado(id)).isEqualTo("BORRADOR");
+
+        // Cuando el borrado vuelve a ser posible y el borrador ya es viejo, la limpieza lo descarta.
+        jdbc.update("delete from offer_sales where offer_id = ?", id);
+        jdbc.update("update offers set creado_en = ? where id = ?",
+                Timestamp.from(Instant.now().minus(10, ChronoUnit.MINUTES)), id);
+        scheduler.runNow();
+        assertThat(estado(id)).isNull();
+    }
+
+    @Test
+    void cancelarElViajeCierraLasOfertasPeroNoAnunciaLosBorradores() {
+        reservaConAsientos();
+        OfferResponse activa = crear();
+        Offer pendiente = borrador(Instant.now());
+
+        // Como EventConsumer: el manejador del evento ItineraryCancelled corre dentro de una transacción.
+        tx.executeWithoutResult(s -> offerService.onItineraryCancelled(itineraryId));
+
+        OfferResponse cerrada = offerService.get(activa.offerId());
+        assertThat(cerrada.estado()).isEqualTo("CERRADA");
+        assertThat(cerrada.motivoCierre()).isEqualTo("ITINERARIO_CANCELADO");
+        assertThat(quotaCounter.isInitialized(activa.offerId())).isFalse();
+        assertThat(estado(pendiente.getId())).isEqualTo("BORRADOR");
+
+        // Cerrar de nuevo no cambia el motivo; cerrar un borrador no lo convierte en oferta visible.
+        offerService.close(activa.offerId(), "CERRADA_MANUALMENTE");
+        assertThat(offerService.get(activa.offerId()).motivoCierre()).isEqualTo("ITINERARIO_CANCELADO");
+        offerService.close(pendiente.getId(), "CERRADA_MANUALMENTE");
+        assertThat(estado(pendiente.getId())).isEqualTo("BORRADOR");
+        assertThatThrownBy(() -> offerService.get(pendiente.getId())).extracting("code").isEqualTo("OFFER_NOT_FOUND");
+        offerRepository.deleteById(pendiente.getId());
+    }
+
+    @Test
+    void cupoYReservaPorRetencionSoloParaOfertasVisibles() {
+        reservaConAsientos();
+        when(seatInventory.hold(any(), anyString(), any(), any())).thenAnswer(inv ->
+                new SeatInventoryClient.Hold(UUID.randomUUID(), inv.getArgument(0), List.of((String) inv.getArgument(1)),
+                        inv.getArgument(2), inv.getArgument(3), "ACTIVA", Instant.now().plusSeconds(600)));
+        OfferResponse offer = crear();
+        var reserva = offerService.reserve(offer.offerId(), UUID.randomUUID(), "CC777").reservation();
+
+        var quota = offerService.quota(offer.offerId());
+        assertThat(quota.estado()).isEqualTo("ACTIVA");
+        assertThat(quota.cupoMax()).isEqualTo(3);
+        assertThat(quota.cupoRestante()).isEqualTo(2);
+        assertThat(offerService.reservationByHold(offer.offerId(), reserva.holdId()).reservationId())
+                .isEqualTo(reserva.reservationId());
+        assertThatThrownBy(() -> offerService.reservationByHold(offer.offerId(), UUID.randomUUID()))
+                .extracting("code").isEqualTo("OFFER_RESERVATION_NOT_FOUND");
+
+        Offer pendiente = borrador(Instant.now());
+        assertThatThrownBy(() -> offerService.reservationByHold(pendiente.getId(), reserva.holdId()))
+                .extracting("code").isEqualTo("OFFER_NOT_FOUND");
+        offerRepository.deleteById(pendiente.getId());
     }
 }
