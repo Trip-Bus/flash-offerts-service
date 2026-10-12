@@ -74,7 +74,7 @@ public class Offer {
         this.fin = fin;
         this.creadoPor = creadoPor;
         this.creadoEn = now;
-        this.estado = OfferStatus.PROGRAMADA;
+        this.estado = OfferStatus.BORRADOR;
     }
 
     public boolean vigente(Instant now) {
@@ -87,6 +87,17 @@ public class Offer {
         if (cupoMax > asientos.size()) {
             cupoMax = asientos.size();
         }
+    }
+
+    /** El borrador ya tiene sus asientos reservados: pasa a PROGRAMADA y el scheduler ya puede activarlo. */
+    public void programar() {
+        if (estado == OfferStatus.BORRADOR) {
+            this.estado = OfferStatus.PROGRAMADA;
+        }
+    }
+
+    public boolean borrador() {
+        return estado == OfferStatus.BORRADOR;
     }
 
     public void activar(Instant now) {

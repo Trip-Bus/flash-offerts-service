@@ -38,9 +38,13 @@
              (varía entre corridas: OfferScheduler corre en segundo plano según el reloj; en el CI midió 54 %,
              en local 55,4-56,8 %: se toma la más baja para que el control no falle al azar);
              ramas 43,5 % -> 0.40. AMBOS están por debajo del 0.60 de referencia (hoy solo hay pruebas de
-             config y la IT del cupo): subirlos con pruebas de controladores, clientes y eventos es la próxima meta. -->
-        <jacoco.minimo.lineas>0.50</jacoco.minimo.lineas>
-        <jacoco.minimo.ramas>0.40</jacoco.minimo.ramas>
+             config y la IT del cupo): subirlos con pruebas de controladores, clientes y eventos es la próxima meta.
+             2026-10-12 (OfferDraftIT, US-054): líneas 59,7 % -> 0.55; ramas 45,2 % se queda en 0.40 (0.45 dejaría
+             menos de un punto de margen frente a la variación entre corridas descrita arriba).
+             2026-10-12 (pruebas de borrador, compensación y limpieza): líneas 65,4 % -> 0.60 y ramas 52,2 % -> 0.50
+             (0.65 de líneas dejaría menos de medio punto de margen; misma razón que arriba). -->
+        <jacoco.minimo.lineas>0.60</jacoco.minimo.lineas>
+        <jacoco.minimo.ramas>0.50</jacoco.minimo.ramas>
 
         <!-- SonarQube Cloud: el análisis lo lanza el CI solo en develop (push y PR con base develop)
              cuando existe el secreto SONAR_TOKEN. El plan Free analiza una única rama. -->
