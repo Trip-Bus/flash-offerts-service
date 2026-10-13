@@ -1,0 +1,84 @@
+# Entorno QA de flash-offers-service SOLO (perfil Spring "qa"): su propia PostgreSQL, Redis con
+# contraseña y el servicio construido desde este repo.
+#
+#   cp .env.example .env           # valores de QA local (el .env no se sube a git)
+#   docker compose up -d --build   # levantar
+#   docker compose ps              # esperar a que todo esté "healthy"
+#   docker compose logs -f flash-offers-service
+#   docker compose down            # detener conservando datos (down -v los borra)
+#
+# Qué se puede probar con este compose solo:
+#   - GET /offers, /offers/{id} y /offers/{id}/quota funcionan solos (son públicos).
+#   - Crear/activar/cerrar (OPERADOR o ADMIN) y reservar exigen un JWT de identity y además llaman a
+#     catalog (validar el itinerario) y a seat-inventory (apartar y retener asientos): pruébalos con
+#     el compose general de API-gateway.
+# identity (18001), catalog (18002) y seat-inventory (18003) se buscan en tu PC vía host.docker.internal.
+#
+# OJO: no lo corras a la vez que el compose general de API-gateway: usan los mismos puertos
+# (18006, 18100, 18106) y fallaría con "port is already allocated".
+name: tripbus-flash-offers-service
+
+services:
+  offers-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tripbus_offers
+      POSTGRES_USER: ${DB_USERNAME:?Falta DB_USERNAME en .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
+    ports:
+      - "18106:5432"
+    volumes:
+      - offers-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Falta REDIS_PASSWORD en .env}"]
+    environment:
+      # redis-cli lee la contraseña de aquí (así no aparece en la línea de comandos).
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    ports:
+      - "18100:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  flash-offers-service:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: qa-local
+    image: ghcr.io/trip-bus/flash-offerts-service:qa-local
+    env_file: .env
+    # Estas ganan sobre .env: dentro de Docker se habla con los contenedores por nombre y puerto
+    # interno, y con los servicios que corren en tu PC por host.docker.internal.
+    environment:
+      SPRING_PROFILES_ACTIVE: qa
+      DB_HOST: offers-db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      IDENTITY_JWKS_URI: http://host.docker.internal:18001/.well-known/jwks.json
+      CATALOG_URL: http://host.docker.internal:18002
+      SEAT_INVENTORY_URL: http://host.docker.internal:18003
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "18006:18006"
+    depends_on:
+      offers-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  offers-db-data:
+  redis-data:

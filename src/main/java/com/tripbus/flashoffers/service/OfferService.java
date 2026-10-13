@@ -94,37 +94,82 @@ public class OfferService {
 
         Offer draft = new Offer(request.itineraryId(), request.precioOferta(), request.cupo(),
                 request.inicio().isBefore(now) ? now : request.inicio(), request.fin(), userId, now);
+        // Se guarda como BORRADOR: el scheduler no la activa (ni se lista) hasta tener sus asientos reservados.
         tx.executeWithoutResult(s -> offerRepository.save(draft));
 
         SeatInventoryClient.OfferSeats reserved;
         try {
             reserved = seatInventory.reserveOfferSeats(draft.getId(), draft.getItineraryId(), seats);
         } catch (RuntimeException e) {
-            tx.executeWithoutResult(s -> offerRepository.deleteById(draft.getId()));
+            // Puede ser un timeout con la reserva ya hecha en Seat Inventory: se liberan por si acaso.
+            discardDraft(draft.getId());
             throw e;
         }
-        if (reserved.reservados().isEmpty()) {
-            tx.executeWithoutResult(s -> offerRepository.deleteById(draft.getId()));
+        if (reserved == null || reserved.reservados() == null || reserved.reservados().isEmpty()) {
+            discardDraft(draft.getId());
             throw ApiException.conflict("NO_SEATS_AVAILABLE", "Ninguno de los asientos indicados está disponible");
         }
 
-        tx.executeWithoutResult(s -> {
-            Offer offer = offerRepository.lockById(draft.getId()).orElseThrow();
-            offer.asignarAsientos(reserved.reservados());
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("offerId", offer.getId());
-            payload.put("itineraryId", offer.getItineraryId());
-            payload.put("seatNumbers", reserved.reservados());
-            payload.put("precioOferta", offer.getPrecioOferta());
-            payload.put("cupoMax", offer.getCupoMax());
-            payload.put("inicio", offer.getInicio());
-            payload.put("fin", offer.getFin());
-            events.publishAfterCommit(OfferEvents.OFFER_CREATED, payload);
-        });
+        try {
+            tx.executeWithoutResult(s -> scheduleDraft(draft.getId(), reserved.reservados()));
+        } catch (RuntimeException e) {
+            discardDraft(draft.getId());
+            throw e;
+        }
         if (!draft.getInicio().isAfter(now)) {
             tx.executeWithoutResult(s -> activate(draft.getId()));
         }
         return tx.execute(s -> get(draft.getId()));
+    }
+
+    /** Borrador -> PROGRAMADA con sus asientos, en la misma transacción que publica OfferCreated. */
+    private void scheduleDraft(UUID offerId, List<String> reservados) {
+        Offer offer = offerRepository.lockById(offerId)
+                .filter(Offer::borrador)
+                .orElseThrow(() -> ApiException.conflict("OFFER_DRAFT_EXPIRED",
+                        "El borrador de la oferta expiró antes de reservar sus asientos"));
+        offer.asignarAsientos(reservados);
+        offer.programar();
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("offerId", offer.getId());
+        payload.put("itineraryId", offer.getItineraryId());
+        payload.put("seatNumbers", reservados);
+        payload.put("precioOferta", offer.getPrecioOferta());
+        payload.put("cupoMax", offer.getCupoMax());
+        payload.put("inicio", offer.getInicio());
+        payload.put("fin", offer.getFin());
+        events.publishAfterCommit(OfferEvents.OFFER_CREATED, payload);
+    }
+
+    /**
+     * Compensación de create(): libera en Seat Inventory los asientos que pudieran haber quedado EN_OFERTA y
+     * borra el borrador. Nunca lanza, para no ocultar el error original; lo que falle lo recoge
+     * {@link #purgeStaleDraft(UUID)}.
+     */
+    private void discardDraft(UUID offerId) {
+        try {
+            seatInventory.releaseOfferSeats(offerId);
+        } catch (RuntimeException e) {
+            log.warn("No se pudieron liberar los asientos del borrador {}: {}", offerId, e.getMessage());
+        }
+        try {
+            tx.executeWithoutResult(s -> offerRepository.lockById(offerId)
+                    .filter(Offer::borrador)
+                    .ifPresent(offerRepository::delete));
+        } catch (RuntimeException e) {
+            log.warn("No se pudo borrar el borrador {}: {}", offerId, e.getMessage());
+        }
+    }
+
+    /**
+     * Limpieza de un borrador abandonado (caída a mitad de create o compensación fallida): libera sus asientos y lo
+     * borra. Si Seat Inventory no responde se conserva el borrador para reintentarlo en la siguiente pasada.
+     */
+    public void purgeStaleDraft(UUID offerId) {
+        seatInventory.releaseOfferSeats(offerId);
+        tx.executeWithoutResult(s -> offerRepository.lockById(offerId)
+                .filter(Offer::borrador)
+                .ifPresent(offerRepository::delete));
     }
 
     // ------------------------------------------------------------------ Activate / Close
@@ -157,7 +202,8 @@ public class OfferService {
     public void close(UUID offerId, String motivo) {
         Offer offer = offerRepository.lockById(offerId)
                 .orElseThrow(() -> ApiException.notFound("OFFER_NOT_FOUND", "La oferta no existe"));
-        if (offer.getEstado() == OfferStatus.CERRADA) {
+        // Un borrador no se anuncia: si queda abandonado lo borra la limpieza del scheduler.
+        if (offer.getEstado() == OfferStatus.CERRADA || offer.borrador()) {
             return;
         }
         offer.cerrar(motivo);
@@ -179,8 +225,7 @@ public class OfferService {
     }
 
     public ReserveResult reserve(UUID offerId, UUID userId, String docId) {
-        Offer offer = offerRepository.findById(offerId)
-                .orElseThrow(() -> ApiException.notFound("OFFER_NOT_FOUND", "La oferta no existe"));
+        Offer offer = findVisible(offerId);
         var existing = saleRepository.findByOfferIdAndUserIdAndDocId(offerId, userId, docId);
         if (existing.isPresent() && existing.get().viva()) {
             return new ReserveResult(toReservation(existing.get(), offer), false);
@@ -307,15 +352,13 @@ public class OfferService {
 
     @Transactional(readOnly = true)
     public OfferResponse get(UUID offerId) {
-        Offer offer = offerRepository.findById(offerId)
-                .orElseThrow(() -> ApiException.notFound("OFFER_NOT_FOUND", "La oferta no existe"));
-        return toResponse(offer);
+        return toResponse(findVisible(offerId));
     }
 
     @Transactional(readOnly = true)
     public List<OfferResponse> list(UUID itineraryId) {
         List<Offer> offers = itineraryId != null
-                ? offerRepository.findByItineraryIdOrderByInicioDesc(itineraryId)
+                ? offerRepository.findByItineraryIdAndEstadoNotOrderByInicioDesc(itineraryId, OfferStatus.BORRADOR)
                 : offerRepository.findByEstadoInOrderByInicioAsc(
                         List.of(OfferStatus.PROGRAMADA, OfferStatus.ACTIVA, OfferStatus.AGOTADA));
         return offers.stream().map(this::toResponse).toList();
@@ -324,16 +367,14 @@ public class OfferService {
     /** GetRemainingQuota + tiempo restante (US-056). */
     @Transactional(readOnly = true)
     public QuotaResponse quota(UUID offerId) {
-        Offer offer = offerRepository.findById(offerId)
-                .orElseThrow(() -> ApiException.notFound("OFFER_NOT_FOUND", "La oferta no existe"));
+        Offer offer = findVisible(offerId);
         return new QuotaResponse(offer.getId(), offer.getEstado().name(), offer.getCupoMax(), remaining(offer),
                 offer.getFin(), secondsLeft(offer));
     }
 
     @Transactional(readOnly = true)
     public ReservationResponse reservationByHold(UUID offerId, UUID holdId) {
-        Offer offer = offerRepository.findById(offerId)
-                .orElseThrow(() -> ApiException.notFound("OFFER_NOT_FOUND", "La oferta no existe"));
+        Offer offer = findVisible(offerId);
         OfferSale sale = saleRepository.findByOfferIdAndHoldId(offerId, holdId)
                 .filter(OfferSale::viva)
                 .orElseThrow(() -> ApiException.notFound("OFFER_RESERVATION_NOT_FOUND",
@@ -342,6 +383,13 @@ public class OfferService {
     }
 
     // ------------------------------------------------------------------ utilidades
+
+    /** Un borrador (aún sin asientos reservados) no existe para los clientes: ni se consulta ni se reserva. */
+    private Offer findVisible(UUID offerId) {
+        return offerRepository.findById(offerId)
+                .filter(o -> !o.borrador())
+                .orElseThrow(() -> ApiException.notFound("OFFER_NOT_FOUND", "La oferta no existe"));
+    }
 
     /** Inicializa el contador desde la BD (cupo restante real y asientos libres). Requiere transacción. */
     private void initializeCounter(Offer offer) {

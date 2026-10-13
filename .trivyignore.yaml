@@ -1,0 +1,21 @@
+# Vulnerabilidades ACEPTADAS temporalmente por Trivy (CI y escaneo local).
+# Regla: solo se aceptan las que NO tienen arreglo en la línea Spring Boot 3.x. Todo lo que tenga
+# parche se corrige subiendo versiones, nunca se ignora aquí.
+# Cada entrada vence en expired_at: a partir de esa fecha Trivy vuelve a fallar, para obligar a
+# revisar la decisión (la salida prevista es migrar a Spring Boot 4.1 / Spring Framework 7).
+# Verificado con Trivy 0.70.0 sobre esta imagen (2026-10-09): son las únicas CRITICAL/HIGH con arreglo.
+vulnerabilities:
+  - id: CVE-2026-47884
+    statement: >-
+      spring-webmvc 6.2.19: RCE vía XsltView. Solo se corrige en Spring Framework 7.0.9; no hay
+      arreglo en Spring Boot 3.x. flash-offers-service no usa XsltView ni ninguna vista: solo
+      @RestController que responden JSON (/offers/** e /internal/offers/**).
+      Se resuelve con la migración a Spring Boot 4.1.
+    expired_at: 2027-01-31
+  - id: CVE-2026-47890
+    statement: >-
+      spring-webmvc 6.2.19: corrupción de flujos Server-Sent Events con view fragments. Solo se
+      corrige en Spring Framework 7.0.9; no hay arreglo en Spring Boot 3.x. flash-offers-service no
+      expone SSE: el cupo en vivo se publica como evento OfferQuotaUpdated en el stream de Redis y lo
+      entrega a los clientes realtime-gateway. Se resuelve con la migración a Spring Boot 4.1.
+    expired_at: 2027-01-31

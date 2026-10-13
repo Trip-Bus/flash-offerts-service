@@ -7,18 +7,20 @@ import com.tripbus.flashoffers.service.OfferService;
 import com.tripbus.flashoffers.service.QuotaCounter;
 import com.tripbus.flashoffers.web.dto.CreateOfferRequest;
 import com.tripbus.flashoffers.web.dto.OfferResponse;
-import org.flywaydb.core.Flyway;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
-import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -44,16 +46,27 @@ import static org.mockito.Mockito.when;
 
 /**
  * US-058: 1.000 solicitudes concurrentes sobre una oferta con cupo 20 → exactamente 20
- * reservas y el contador nunca baja de cero. Requiere PostgreSQL y Redis reales.
+ * reservas y el contador nunca baja de cero. Gate de la HU: corre contra PostgreSQL 16 y Redis 7
+ * reales (Testcontainers, requiere Docker): Flyway aplica las migraciones REALES de db/migration y el
+ * contador de cupo es el script Lua real de QuotaCounter. Catalog y Seat Inventory se simulan.
  */
-@EnabledIfEnvironmentVariable(named = "TRIPBUS_IT", matches = "true")
 @SpringBootTest
 @ActiveProfiles("it")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@Testcontainers
 class FlashOfferQuotaIT {
 
     private static final int SOLICITUDES = 1000;
     private static final int CUPO = 20;
+
+    // Contenedores nuevos en cada ejecución: la base y el Redis empiezan vacíos (no hace falta flyway.clean).
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Container
+    @ServiceConnection(name = "redis")
+    static GenericContainer<?> redisContainer = new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
 
     @Autowired
     private OfferService offerService;
@@ -63,22 +76,14 @@ class FlashOfferQuotaIT {
     private StringRedisTemplate redis;
     @Autowired
     private JdbcTemplate jdbc;
-    @Autowired
-    private Flyway flyway;
 
-    @MockBean
+    @MockitoBean
     private SeatInventoryClient seatInventory;
-    @MockBean
+    @MockitoBean
     private CatalogClient catalog;
 
     private final UUID companyId = UUID.randomUUID();
     private final UUID itineraryId = UUID.randomUUID();
-
-    @BeforeAll
-    void limpiar() {
-        flyway.clean();
-        flyway.migrate();
-    }
 
     @BeforeEach
     void simular() {
