@@ -10,6 +10,7 @@ public record OfferResponse(
         UUID itineraryId,
         BigDecimal precioOferta,
         int cupoMax,
+        int maxPorUsuario,
         int cupoRestante,
         Instant inicio,
         Instant fin,

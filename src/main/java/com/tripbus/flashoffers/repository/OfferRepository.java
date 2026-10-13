@@ -36,4 +36,7 @@ public interface OfferRepository extends JpaRepository<Offer, UUID> {
     @Query("select o.id from Offer o where o.itineraryId = :itineraryId and o.estado <> :estado")
     List<UUID> findIdsByItineraryIdAndEstadoNot(@Param("itineraryId") UUID itineraryId,
                                                 @Param("estado") OfferStatus estado);
+
+    @Query("select o.id from Offer o where o.estado = :estado")
+    List<UUID> findIdsByEstado(@Param("estado") OfferStatus estado);
 }
