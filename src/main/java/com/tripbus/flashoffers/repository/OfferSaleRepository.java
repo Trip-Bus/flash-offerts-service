@@ -26,4 +26,6 @@ public interface OfferSaleRepository extends JpaRepository<OfferSale, UUID> {
     long countByOfferIdAndEstadoIn(UUID offerId, Collection<SaleStatus> estados);
 
     List<OfferSale> findByOfferIdAndEstadoIn(UUID offerId, Collection<SaleStatus> estados);
+
+    long countByOfferIdAndUserIdAndEstadoIn(UUID offerId, UUID userId, Collection<SaleStatus> estados);
 }

@@ -19,6 +19,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -31,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -51,11 +54,12 @@ public class OfferService {
     private final CatalogClient catalog;
     private final EventPublisher events;
     private final TransactionTemplate tx;
+    private final JdbcTemplate jdbc;
     private final Clock clock;
 
     public OfferService(OfferRepository offerRepository, OfferSaleRepository saleRepository, QuotaCounter quota,
                         SeatInventoryClient seatInventory, CatalogClient catalog, EventPublisher events,
-                        TransactionTemplate tx, Clock clock) {
+                        TransactionTemplate tx, JdbcTemplate jdbc, Clock clock) {
         this.offerRepository = offerRepository;
         this.saleRepository = saleRepository;
         this.quota = quota;
@@ -63,6 +67,7 @@ public class OfferService {
         this.catalog = catalog;
         this.events = events;
         this.tx = tx;
+        this.jdbc = jdbc;
         this.clock = clock;
     }
 
@@ -76,6 +81,13 @@ public class OfferService {
         }
         if (request.cupo() > seats.size()) {
             throw ApiException.badRequest("QUOTA_EXCEEDS_SEATS", "El cupo no puede ser mayor que los asientos de la oferta");
+        }
+        int maxPorUsuario = request.maxPorUsuario() != null
+                ? request.maxPorUsuario()
+                : Math.min(Offer.DEFAULT_MAX_POR_USUARIO, request.cupo());
+        if (maxPorUsuario > request.cupo()) {
+            throw ApiException.badRequest("MAX_PER_USER_EXCEEDS_QUOTA",
+                    "El máximo por usuario no puede ser mayor que el cupo de la oferta");
         }
         CatalogClient.Itinerary itinerary = catalog.itinerary(request.itineraryId());
         if (!"PROGRAMADO".equals(itinerary.estado())) {
@@ -92,7 +104,7 @@ public class OfferService {
             throw ApiException.forbidden("NOT_YOUR_COMPANY", "Solo puede crear ofertas para viajes de su empresa");
         }
 
-        Offer draft = new Offer(request.itineraryId(), request.precioOferta(), request.cupo(),
+        Offer draft = new Offer(request.itineraryId(), request.precioOferta(), request.cupo(), maxPorUsuario,
                 request.inicio().isBefore(now) ? now : request.inicio(), request.fin(), userId, now);
         // Se guarda como BORRADOR: el scheduler no la activa (ni se lista) hasta tener sus asientos reservados.
         tx.executeWithoutResult(s -> offerRepository.save(draft));
@@ -238,49 +250,34 @@ public class OfferService {
             throw ApiException.conflict("OFFER_NOT_ACTIVE", "La oferta no está activa");
         }
 
-        String seat;
         try {
             if (!quota.isInitialized(offerId)) {
                 tx.executeWithoutResult(s -> initializeCounter(offerRepository.findById(offerId).orElseThrow()));
             }
-            seat = quota.reserve(offerId);
         } catch (DataAccessException e) {
             throw ApiException.unavailable("QUOTA_UNAVAILABLE", "El contador de cupo no está disponible");
         }
-        if (seat == null) {
-            markSoldOut(offerId);
-            throw ApiException.conflict("OUT_OF_STOCK", "La oferta se agotó");
-        }
 
-        SeatInventoryClient.Hold hold;
-        try {
-            hold = seatInventory.hold(offer.getItineraryId(), seat, userId, offerId);
-        } catch (RuntimeException e) {
-            giveBackQuietly(offerId, seat);
-            throw e;
-        }
-
+        Attempt attempt = new Attempt();
         OfferSale sale;
         try {
-            sale = tx.execute(s -> {
-                var previous = saleRepository.findByOfferIdAndUserIdAndDocId(offerId, userId, docId);
-                if (previous.isPresent()) {
-                    OfferSale p = previous.get();
-                    if (p.viva()) {
-                        throw new DataIntegrityViolationException("reserva concurrente de la misma persona");
-                    }
-                    p.reservarDeNuevo(seat, hold.holdId(), clock.instant());
-                    return p;
-                }
-                return saleRepository.saveAndFlush(new OfferSale(offerId, userId, docId, seat, hold.holdId(),
-                        clock.instant()));
-            });
+            sale = tx.execute(s -> reserveLocked(offer, userId, docId, attempt));
         } catch (DataIntegrityViolationException e) {
-            // La misma persona reservó en paralelo: se deshace esta segunda reserva.
-            releaseHoldQuietly(hold.holdId());
-            giveBackQuietly(offerId, seat);
+            // Choque con otra venta viva al guardar: se deshace esta reserva y se devuelve la existente.
+            undo(offerId, attempt, "RESERVA_DUPLICADA");
             OfferSale winner = saleRepository.findByOfferIdAndUserIdAndDocId(offerId, userId, docId).orElseThrow();
             return new ReserveResult(toReservation(winner, offer), false);
+        } catch (RuntimeException e) {
+            // Incluye un fallo del commit: el cupo y la retención ya tomados se devuelven.
+            undo(offerId, attempt, "RESERVA_FALLIDA");
+            throw e;
+        }
+        if (attempt.existing != null) {
+            return new ReserveResult(toReservation(attempt.existing, offer), false);
+        }
+        if (attempt.soldOut) {
+            markSoldOut(offerId);
+            throw ApiException.conflict("OUT_OF_STOCK", "La oferta se agotó");
         }
 
         Integer remaining = quota.remaining(offerId);
@@ -289,6 +286,60 @@ public class OfferService {
             markSoldOut(offerId);
         }
         return new ReserveResult(toReservation(Objects.requireNonNull(sale), offer), true);
+    }
+
+    /** Lo que la transacción de reserva tomó fuera de la BD (para deshacerlo si falla) y cómo terminó. */
+    private static final class Attempt {
+        private String seat;
+        private SeatInventoryClient.Hold hold;
+        private OfferSale existing;
+        private boolean soldOut;
+    }
+
+    /**
+     * Núcleo de la reserva, en una transacción. Un lock asesor de PostgreSQL por (oferta, usuario), que se suelta
+     * solo al terminar la transacción, serializa las reservas de la misma persona: el conteo de sus ventas vivas
+     * y la venta nueva no se intercalan con otra reserva suya, y el límite se valida antes de tocar el cupo de Redis.
+     */
+    private OfferSale reserveLocked(Offer offer, UUID userId, String docId, Attempt attempt) {
+        UUID offerId = offer.getId();
+        jdbc.query("select pg_advisory_xact_lock(hashtext(?))", rs -> { }, "offer-user:" + offerId + ":" + userId);
+        var previous = saleRepository.findByOfferIdAndUserIdAndDocId(offerId, userId, docId);
+        if (previous.isPresent() && previous.get().viva()) {
+            attempt.existing = previous.get();
+            return null;
+        }
+        if (saleRepository.countByOfferIdAndUserIdAndEstadoIn(offerId, userId, VIVAS) >= offer.getMaxPorUsuario()) {
+            throw new ApiException(HttpStatus.CONFLICT, "USER_LIMIT_REACHED",
+                    "Ya tiene el máximo de cupos permitido por persona en esta oferta",
+                    Map.of("maxPorUsuario", offer.getMaxPorUsuario()));
+        }
+        try {
+            attempt.seat = quota.reserve(offerId);
+        } catch (DataAccessException e) {
+            throw ApiException.unavailable("QUOTA_UNAVAILABLE", "El contador de cupo no está disponible");
+        }
+        if (attempt.seat == null) {
+            attempt.soldOut = true;
+            return null;
+        }
+        attempt.hold = seatInventory.hold(offer.getItineraryId(), attempt.seat, userId, offerId);
+        if (previous.isPresent()) {
+            OfferSale p = previous.get();
+            p.reservarDeNuevo(attempt.seat, attempt.hold.holdId(), clock.instant());
+            return p;
+        }
+        return saleRepository.saveAndFlush(new OfferSale(offerId, userId, docId, attempt.seat, attempt.hold.holdId(),
+                clock.instant()));
+    }
+
+    private void undo(UUID offerId, Attempt attempt, String motivo) {
+        if (attempt.hold != null) {
+            releaseHoldQuietly(attempt.hold.holdId(), motivo);
+        }
+        if (attempt.seat != null) {
+            giveBackQuietly(offerId, attempt.seat);
+        }
     }
 
     private void markSoldOut(UUID offerId) {
@@ -393,12 +444,28 @@ public class OfferService {
 
     /** Inicializa el contador desde la BD (cupo restante real y asientos libres). Requiere transacción. */
     private void initializeCounter(Offer offer) {
+        ExpectedQuota esperado = expectedQuota(offer);
+        quota.initialize(offer.getId(), esperado.restante(), esperado.libres());
+    }
+
+    /** Cupo que debería tener el contador según la BD: cupo menos ventas vivas, y los asientos aún libres. */
+    public record ExpectedQuota(int restante, List<String> libres) {
+    }
+
+    private ExpectedQuota expectedQuota(Offer offer) {
         List<OfferSale> vivas = saleRepository.findByOfferIdAndEstadoIn(offer.getId(), VIVAS);
         Set<String> ocupados = new HashSet<>();
         vivas.forEach(v -> ocupados.add(v.getSeatNumber()));
         List<String> libres = offer.getAsientos().stream().filter(a -> !ocupados.contains(a)).toList();
-        int restante = Math.min(offer.getCupoMax() - vivas.size(), libres.size());
-        quota.initialize(offer.getId(), restante, libres);
+        return new ExpectedQuota(Math.max(0, Math.min(offer.getCupoMax() - vivas.size(), libres.size())), libres);
+    }
+
+    /** Reconciliación del cupo (QuotaReconciler): el cupo esperado si la oferta sigue ACTIVA; si no, vacío. */
+    @Transactional(readOnly = true)
+    public Optional<ExpectedQuota> expectedQuotaIfActive(UUID offerId) {
+        return offerRepository.findById(offerId)
+                .filter(o -> o.getEstado() == OfferStatus.ACTIVA)
+                .map(this::expectedQuota);
     }
 
     private int remaining(Offer offer) {
@@ -434,9 +501,9 @@ public class OfferService {
         }
     }
 
-    private void releaseHoldQuietly(UUID holdId) {
+    private void releaseHoldQuietly(UUID holdId, String motivo) {
         try {
-            seatInventory.releaseHold(holdId, "RESERVA_DUPLICADA");
+            seatInventory.releaseHold(holdId, motivo);
         } catch (RuntimeException e) {
             log.warn("No se pudo liberar la retención {}: {}", holdId, e.getMessage());
         }
@@ -452,7 +519,7 @@ public class OfferService {
 
     private OfferResponse toResponse(Offer offer) {
         return new OfferResponse(offer.getId(), offer.getItineraryId(), offer.getPrecioOferta(), offer.getCupoMax(),
-                remaining(offer), offer.getInicio(), offer.getFin(), offer.getEstado().name(), secondsLeft(offer),
+                offer.getMaxPorUsuario(), remaining(offer), offer.getInicio(), offer.getFin(), offer.getEstado().name(), secondsLeft(offer),
                 List.copyOf(offer.getAsientos()), offer.getMotivoCierre());
     }
 

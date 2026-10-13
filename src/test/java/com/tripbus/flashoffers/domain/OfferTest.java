@@ -45,4 +45,17 @@ class OfferTest {
         assertThat(offer.getEstado()).isEqualTo(OfferStatus.CERRADA);
         assertThat(offer.getMotivoCierre()).isEqualTo("EXPIRADA");
     }
+
+    @Test
+    void elMaximoPorUsuarioPorDefectoEsDosYNuncaSuperaElCupo() {
+        assertThat(nueva().getMaxPorUsuario()).isEqualTo(Offer.DEFAULT_MAX_POR_USUARIO);
+
+        Offer offer = new Offer(UUID.randomUUID(), new BigDecimal("49900"), 5, 4, now.plusSeconds(60),
+                now.plusSeconds(3600), UUID.randomUUID(), now);
+        offer.asignarAsientos(List.of("1", "2", "3"));
+        assertThat(offer.getMaxPorUsuario()).as("se ajusta al cupo reducido").isEqualTo(3);
+
+        offer.asignarAsientos(List.of("1", "2", "3"));
+        assertThat(offer.getMaxPorUsuario()).isEqualTo(3);
+    }
 }

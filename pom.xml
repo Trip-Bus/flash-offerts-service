@@ -42,9 +42,11 @@
              2026-10-12 (OfferDraftIT, US-054): líneas 59,7 % -> 0.55; ramas 45,2 % se queda en 0.40 (0.45 dejaría
              menos de un punto de margen frente a la variación entre corridas descrita arriba).
              2026-10-12 (pruebas de borrador, compensación y limpieza): líneas 65,4 % -> 0.60 y ramas 52,2 % -> 0.50
-             (0.65 de líneas dejaría menos de medio punto de margen; misma razón que arriba). -->
-        <jacoco.minimo.lineas>0.60</jacoco.minimo.lineas>
-        <jacoco.minimo.ramas>0.50</jacoco.minimo.ramas>
+             (0.65 de líneas dejaría menos de medio punto de margen; misma razón que arriba).
+             2026-10-12 (límite por usuario y reconciliación del cupo, US-058): líneas 68,8 % -> 0.65 y
+             ramas 59,8 % -> 0.55. -->
+        <jacoco.minimo.lineas>0.65</jacoco.minimo.lineas>
+        <jacoco.minimo.ramas>0.55</jacoco.minimo.ramas>
 
         <!-- SonarQube Cloud: el análisis lo lanza el CI solo en develop (push y PR con base develop)
              cuando existe el secreto SONAR_TOKEN. El plan Free analiza una única rama. -->
@@ -170,6 +172,13 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Esperas sobre jobs en segundo plano (reconciliación del cupo en OfferUserLimitIT). -->
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>

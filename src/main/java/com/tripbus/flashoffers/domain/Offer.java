@@ -22,6 +22,9 @@ import java.util.UUID;
 @Table(name = "offers")
 public class Offer {
 
+    /** US-058: máximo por persona cuando la oferta no indica otro (o el cupo, si es menor). */
+    public static final int DEFAULT_MAX_POR_USUARIO = 2;
+
     @Id
     private UUID id;
 
@@ -33,6 +36,10 @@ public class Offer {
 
     @Column(name = "cupo_max", nullable = false)
     private int cupoMax;
+
+    /** US-058: cupos que una misma persona (userId) puede tomar en la oferta, sumando todos sus documentos. */
+    @Column(name = "max_por_usuario", nullable = false)
+    private int maxPorUsuario;
 
     @Column(nullable = false)
     private Instant inicio;
@@ -66,10 +73,17 @@ public class Offer {
 
     public Offer(UUID itineraryId, BigDecimal precioOferta, int cupoMax, Instant inicio, Instant fin, UUID creadoPor,
                  Instant now) {
+        this(itineraryId, precioOferta, cupoMax, Math.min(DEFAULT_MAX_POR_USUARIO, cupoMax), inicio, fin, creadoPor,
+                now);
+    }
+
+    public Offer(UUID itineraryId, BigDecimal precioOferta, int cupoMax, int maxPorUsuario, Instant inicio, Instant fin,
+                 UUID creadoPor, Instant now) {
         this.id = UUID.randomUUID();
         this.itineraryId = itineraryId;
         this.precioOferta = precioOferta;
         this.cupoMax = cupoMax;
+        this.maxPorUsuario = maxPorUsuario;
         this.inicio = inicio;
         this.fin = fin;
         this.creadoPor = creadoPor;
@@ -86,6 +100,10 @@ public class Offer {
         this.asientos.addAll(asientos);
         if (cupoMax > asientos.size()) {
             cupoMax = asientos.size();
+        }
+        // ck_offers_max_por_usuario: el máximo por persona nunca supera el cupo.
+        if (maxPorUsuario > cupoMax) {
+            maxPorUsuario = cupoMax;
         }
     }
 
@@ -134,6 +152,10 @@ public class Offer {
 
     public int getCupoMax() {
         return cupoMax;
+    }
+
+    public int getMaxPorUsuario() {
+        return maxPorUsuario;
     }
 
     public Instant getInicio() {
