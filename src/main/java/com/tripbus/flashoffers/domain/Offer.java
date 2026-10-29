@@ -68,6 +68,9 @@ public class Offer {
     @Column(name = "creado_en", nullable = false)
     private Instant creadoEn;
 
+    @Column(name = "agotada_en")
+    private Instant agotadaEn;
+
     @ElementCollection(fetch = FetchType.LAZY)
     @CollectionTable(name = "offer_seats", joinColumns = @JoinColumn(name = "offer_id"))
     @Column(name = "seat_number", nullable = false)
@@ -133,8 +136,9 @@ public class Offer {
         }
     }
 
-    public void agotar() {
+    public void agotar(Instant now) {
         this.estado = OfferStatus.AGOTADA;
+        this.agotadaEn = now;
     }
 
     public void reabrir() {
@@ -190,6 +194,7 @@ public class Offer {
     public Instant getFin() {
         return fin;
     }
+    public Instant getAgotadaEn() { return agotadaEn; }
 
     public OfferStatus getEstado() {
         return estado;

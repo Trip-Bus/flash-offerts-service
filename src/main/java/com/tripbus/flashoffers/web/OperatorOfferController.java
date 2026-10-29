@@ -19,4 +19,6 @@ public class OperatorOfferController {
    @RequestParam(defaultValue="0") int page,@RequestParam(defaultValue="20") int size,Authentication auth){
   return service.operatorOffers(estado,desde,hasta,Math.max(0,page),Math.min(100,Math.max(1,size)),CurrentUser.companyId(auth),CurrentUser.hasRole(auth,"ADMIN"));
  }
+ @GetMapping("/metrics") @PreAuthorize("hasAnyRole('OPERADOR','ADMIN')")
+ public OfferService.OperatorMetrics metrics(@RequestParam @DateTimeFormat(iso=DateTimeFormat.ISO.DATE_TIME) Instant desde,@RequestParam @DateTimeFormat(iso=DateTimeFormat.ISO.DATE_TIME) Instant hasta,Authentication auth){return service.operatorMetrics(desde,hasta,CurrentUser.companyId(auth),CurrentUser.hasRole(auth,"ADMIN"));}
 }

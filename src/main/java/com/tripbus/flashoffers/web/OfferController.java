@@ -21,21 +21,29 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.DeleteMapping;
 
 import java.util.List;
 import java.util.UUID;
+import com.tripbus.flashoffers.service.RouteFollowService;
+import com.tripbus.flashoffers.web.dto.RouteFollowRequest;
+import com.tripbus.flashoffers.web.dto.RouteFollowResponse;
 
 @RestController
 @RequestMapping("/offers")
 public class OfferController {
 
     private final OfferService offerService;
+    private final RouteFollowService follows;
 
-    public OfferController(OfferService offerService) {
-        this.offerService = offerService;
+    @Autowired
+    public OfferController(OfferService offerService, RouteFollowService follows) {
+        this.offerService = offerService; this.follows=follows;
     }
+    /** Constructor conservado para las pruebas y adaptadores existentes. */
+    public OfferController(OfferService offerService) { this(offerService, null); }
 
     /** US-054: crear oferta relámpago (operador de la empresa o administrador). */
     @PostMapping
@@ -52,6 +60,10 @@ public class OfferController {
     public List<OfferResponse> list(@RequestParam(required = false) UUID itineraryId) {
         return offerService.list(itineraryId);
     }
+    @PostMapping("/follows") public ResponseEntity<RouteFollowResponse> follow(@Valid @RequestBody RouteFollowRequest request,Authentication auth){return ResponseEntity.status(HttpStatus.CREATED).body(followService().follow(CurrentUser.id(auth),request));}
+    @GetMapping("/follows") public List<RouteFollowResponse> follows(Authentication auth){return followService().list(CurrentUser.id(auth));}
+    @DeleteMapping("/follows/{id}") public ResponseEntity<Void> unfollow(@PathVariable UUID id,Authentication auth){followService().delete(CurrentUser.id(auth),id);return ResponseEntity.noContent().build();}
+    private RouteFollowService followService(){if(follows==null)throw new IllegalStateException("RouteFollowService no configurado");return follows;}
 
     @GetMapping("/showcase")
     public org.springframework.data.domain.Page<OfferService.ShowcaseOffer> showcase(
@@ -76,6 +88,8 @@ public class OfferController {
     public OfferResponse get(@PathVariable UUID id) {
         return offerService.get(id);
     }
+    @GetMapping("/{id}/metrics") @PreAuthorize("hasAnyRole('OPERADOR','ADMIN')")
+    public OfferService.OfferMetrics metrics(@PathVariable UUID id,Authentication auth){return offerService.metrics(id,CurrentUser.companyId(auth),CurrentUser.hasRole(auth,"ADMIN"));}
 
     /** GetRemainingQuota + tiempo restante (US-056). */
     @GetMapping("/{id}/quota")

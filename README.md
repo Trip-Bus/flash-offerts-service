@@ -1,5 +1,11 @@
 # Flash Offers Service
 
+## Sprint 4: alertas y métricas
+
+- `POST /offers/follows`, `GET /offers/follows` y `DELETE /offers/follows/{id}` permiten al pasajero seguir hasta diez rutas; la coincidencia ignora mayúsculas y tildes.
+- Al activar una oferta se emite un `OfferAlert` privado por cada seguidor de la ruta. El evento contiene `userId`, `offerId`, `itineraryId`, origen, destino, precio de oferta, porcentaje de descuento y fin; su envío es asíncrono e idempotente por usuario/oferta.
+- `GET /offers/{id}/metrics` está disponible para el operador propietario o ADMIN. `GET /operator/offers/metrics?desde=&hasta=` resume hasta 90 días de ofertas de la empresa.
+
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Trip-Bus_flash-offerts-service&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Trip-Bus_flash-offerts-service)
 
 Ofertas relámpago: creación con cupo y horario, contador atómico de cupo, venta sin sobreventa y cupo en vivo.
