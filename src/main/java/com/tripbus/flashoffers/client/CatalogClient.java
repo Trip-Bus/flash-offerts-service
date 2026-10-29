@@ -30,7 +30,10 @@ public class CatalogClient {
     }
 
     public record Itinerary(UUID itineraryId, UUID companyId, BigDecimal precioBase, String estado,
-                            Instant fechaSalida) {
+                            Instant fechaSalida, String origen, String destino, String empresaNombre) {
+        public Itinerary(UUID itineraryId, UUID companyId, BigDecimal precioBase, String estado, Instant fechaSalida) {
+            this(itineraryId, companyId, precioBase, estado, fechaSalida, null, null, null);
+        }
     }
 
     public Itinerary itinerary(UUID itineraryId) {

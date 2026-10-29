@@ -22,7 +22,7 @@ public class OfferEventsHandler implements DomainEventHandler {
     @Override
     public Set<String> eventTypes() {
         return Set.of(OfferEvents.SEAT_SOLD, OfferEvents.SEAT_RELEASED, OfferEvents.HOLD_EXPIRED,
-                OfferEvents.ITINERARY_CANCELLED);
+                OfferEvents.ITINERARY_CANCELLED, OfferEvents.ITINERARY_RESCHEDULED);
     }
 
     @Override
@@ -41,6 +41,8 @@ public class OfferEventsHandler implements DomainEventHandler {
             }
             case OfferEvents.ITINERARY_CANCELLED ->
                     offerService.onItineraryCancelled(UUID.fromString(p.path("itineraryId").asText()));
+            case OfferEvents.ITINERARY_RESCHEDULED -> offerService.onItineraryRescheduled(
+                    UUID.fromString(p.path("itineraryId").asText()), java.time.Instant.parse(p.path("fechaSalida").asText()));
             default -> {
             }
         }

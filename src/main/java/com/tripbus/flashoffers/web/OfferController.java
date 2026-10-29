@@ -7,6 +7,8 @@ import com.tripbus.flashoffers.web.dto.OfferResponse;
 import com.tripbus.flashoffers.web.dto.QuotaResponse;
 import com.tripbus.flashoffers.web.dto.ReservationResponse;
 import com.tripbus.flashoffers.web.dto.ReserveRequest;
+import com.tripbus.flashoffers.web.dto.UpdateOfferRequest;
+import com.tripbus.flashoffers.web.dto.DuplicateOfferRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -19,6 +21,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 
 import java.util.List;
 import java.util.UUID;
@@ -47,6 +51,24 @@ public class OfferController {
     @GetMapping
     public List<OfferResponse> list(@RequestParam(required = false) UUID itineraryId) {
         return offerService.list(itineraryId);
+    }
+
+    @GetMapping("/showcase")
+    public org.springframework.data.domain.Page<OfferService.ShowcaseOffer> showcase(
+            @RequestParam(required=false) String origin, @RequestParam(required=false) String destination,
+            @RequestParam(defaultValue="0") int page, @RequestParam(defaultValue="20") int size) {
+        return offerService.showcase(origin,destination,Math.max(0,page),Math.min(100,Math.max(1,size)));
+    }
+
+    @PutMapping("/{id}") @PreAuthorize("hasAnyRole('OPERADOR','ADMIN')")
+    public OfferResponse update(@PathVariable UUID id,@Valid @RequestBody UpdateOfferRequest request,Authentication auth){
+        return offerService.update(id,request,CurrentUser.companyId(auth),CurrentUser.hasRole(auth,"ADMIN"));
+    }
+    @DeleteMapping("/{id}") @PreAuthorize("hasAnyRole('OPERADOR','ADMIN')")
+    public OfferResponse cancel(@PathVariable UUID id,Authentication auth){return offerService.cancelByOperator(id,CurrentUser.companyId(auth),CurrentUser.hasRole(auth,"ADMIN"));}
+    @PostMapping("/{id}/duplicate") @PreAuthorize("hasAnyRole('OPERADOR','ADMIN')")
+    public ResponseEntity<OfferResponse> duplicate(@PathVariable UUID id,@Valid @RequestBody DuplicateOfferRequest request,Authentication auth){
+        return ResponseEntity.status(HttpStatus.CREATED).body(offerService.duplicate(id,request,CurrentUser.companyId(auth),CurrentUser.hasRole(auth,"ADMIN"),CurrentUser.id(auth)));
     }
 
     /** GetOfferStatus. */

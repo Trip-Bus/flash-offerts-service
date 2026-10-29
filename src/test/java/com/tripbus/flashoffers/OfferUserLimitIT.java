@@ -81,10 +81,11 @@ class OfferUserLimitIT {
     private CatalogClient catalog;
 
     private final UUID companyId = UUID.randomUUID();
-    private final UUID itineraryId = UUID.randomUUID();
+    private UUID itineraryId;
 
     @BeforeEach
     void simular() {
+        itineraryId=UUID.randomUUID();
         when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId, companyId,
                 new BigDecimal("95000"), "PROGRAMADO", Instant.now().plus(2, ChronoUnit.DAYS)));
         when(seatInventory.reserveOfferSeats(any(), any(), anyList())).thenAnswer(inv ->
@@ -100,8 +101,11 @@ class OfferUserLimitIT {
 
     private OfferResponse nuevaOferta(int cupo, Integer maxPorUsuario) {
         List<String> asientos = IntStream.rangeClosed(1, cupo).mapToObj(String::valueOf).toList();
-        return offerService.create(new CreateOfferRequest(itineraryId, asientos, new BigDecimal("49900"), cupo,
-                Instant.now(), Instant.now().plus(1, ChronoUnit.HOURS), maxPorUsuario), UUID.randomUUID(), false, null);
+        Instant start=Instant.now().plus(30,ChronoUnit.SECONDS);
+        OfferResponse created=offerService.create(new CreateOfferRequest(itineraryId, asientos, new BigDecimal("49900"), cupo,
+                start, start.plus(1, ChronoUnit.HOURS), maxPorUsuario), UUID.randomUUID(), false, null);
+        offerService.activate(created.offerId());
+        return offerService.get(created.offerId());
     }
 
     private long ventasVivas(UUID offerId, UUID userId) {

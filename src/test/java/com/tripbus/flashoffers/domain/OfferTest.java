@@ -58,4 +58,31 @@ class OfferTest {
         offer.asignarAsientos(List.of("1", "2", "3"));
         assertThat(offer.getMaxPorUsuario()).isEqualTo(3);
     }
+
+    @Test
+    void guardaDatosDeViajeYRecortaFinAlReprogramar() {
+        Offer offer=nueva(); UUID company=UUID.randomUUID();
+        Instant departure=now.plusSeconds(7200);
+        offer.datosViaje(company,"Bogotá","Cali",departure,new BigDecimal("95000"),"Empresa",false);
+        assertThat(offer.getCompanyId()).isEqualTo(company);
+        assertThat(offer.getOrigen()).isEqualTo("Bogotá");
+        assertThat(offer.getDestino()).isEqualTo("Cali");
+        assertThat(offer.getPrecioBase()).isEqualByComparingTo("95000");
+        assertThat(offer.getEmpresaNombre()).isEqualTo("Empresa");
+        assertThat(offer.isPermiteReprogramar()).isFalse();
+        offer.reprogramarViaje(now.plusSeconds(1800));
+        assertThat(offer.getFechaSalida()).isEqualTo(now.plusSeconds(1800));
+        assertThat(offer.getFin()).isEqualTo(now.plusSeconds(1800));
+    }
+
+    @Test
+    void editaPrecioCupoVentanaAsientosYRegla() {
+        Offer offer=nueva();
+        offer.editar(new BigDecimal("45000"),2,1,now.plusSeconds(120),now.plusSeconds(1800),List.of("A1","A2"),false);
+        assertThat(offer.getPrecioOferta()).isEqualByComparingTo("45000");
+        assertThat(offer.getCupoMax()).isEqualTo(2);
+        assertThat(offer.getMaxPorUsuario()).isEqualTo(1);
+        assertThat(offer.getAsientos()).containsExactly("A1","A2");
+        assertThat(offer.isPermiteReprogramar()).isFalse();
+    }
 }

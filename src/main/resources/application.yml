@@ -79,6 +79,8 @@ tripbus:
   offers:
     seat-inventory-url: ${SEAT_INVENTORY_URL:http://localhost:18003}
     catalog-url: ${CATALOG_URL:http://localhost:18002}
+    min-discount: ${OFFERS_MIN_DISCOUNT:5}
+    max-discount: ${OFFERS_MAX_DISCOUNT:70}
   jobs:
     offer-scheduler-ms: 2000
     # US-058: reconciliación del contador de cupo de Redis con las ventas de la BD (QuotaReconciler).

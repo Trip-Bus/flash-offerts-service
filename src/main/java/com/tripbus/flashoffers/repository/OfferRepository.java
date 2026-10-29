@@ -33,6 +33,13 @@ public interface OfferRepository extends JpaRepository<Offer, UUID> {
 
     List<Offer> findByEstadoInOrderByInicioAsc(Collection<OfferStatus> estados);
 
+    @Query("select o from Offer o where o.itineraryId=:itinerary and o.estado<>:closed and o.inicio < :fin and o.fin > :inicio")
+    List<Offer> findOverlaps(@Param("itinerary") UUID itinerary, @Param("inicio") Instant inicio,
+                             @Param("fin") Instant fin, @Param("closed") OfferStatus closed);
+
+    List<Offer> findByCompanyId(UUID companyId);
+    List<Offer> findByCompanyIdIsNull();
+
     @Query("select o.id from Offer o where o.itineraryId = :itineraryId and o.estado <> :estado")
     List<UUID> findIdsByItineraryIdAndEstadoNot(@Param("itineraryId") UUID itineraryId,
                                                 @Param("estado") OfferStatus estado);

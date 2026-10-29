@@ -9,6 +9,8 @@ import com.tripbus.flashoffers.service.OfferScheduler;
 import com.tripbus.flashoffers.service.OfferService;
 import com.tripbus.flashoffers.service.QuotaCounter;
 import com.tripbus.flashoffers.web.dto.CreateOfferRequest;
+import com.tripbus.flashoffers.web.dto.UpdateOfferRequest;
+import com.tripbus.flashoffers.web.dto.DuplicateOfferRequest;
 import com.tripbus.flashoffers.web.dto.OfferResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -100,9 +102,11 @@ class OfferDraftIT {
     }
 
     private OfferResponse crear() {
-        return offerService.create(new CreateOfferRequest(itineraryId, List.of("1", "2", "3"), new BigDecimal("49900"),
-                3, Instant.now().minusSeconds(5), Instant.now().plus(1, ChronoUnit.HOURS)), UUID.randomUUID(),
-                false, null);
+        Instant start=Instant.now().plus(30,ChronoUnit.SECONDS);
+        OfferResponse created=offerService.create(new CreateOfferRequest(itineraryId, List.of("1", "2", "3"), new BigDecimal("49900"),
+                3, start, start.plus(1, ChronoUnit.HOURS)), UUID.randomUUID(), false, null);
+        offerService.activate(created.offerId());
+        return offerService.get(created.offerId());
     }
 
     private String estado(UUID id) {
@@ -340,5 +344,108 @@ class OfferDraftIT {
         assertThatThrownBy(() -> offerService.reservationByHold(pendiente.getId(), reserva.holdId()))
                 .extracting("code").isEqualTo("OFFER_NOT_FOUND");
         offerRepository.deleteById(pendiente.getId());
+    }
+
+    private OfferResponse crearProgramada() {
+        reservaConAsientos();
+        Instant start=Instant.now().plus(20,ChronoUnit.MINUTES);
+        return offerService.create(new CreateOfferRequest(itineraryId,List.of("1","2","3"),new BigDecimal("49900"),2,
+                start,start.plus(1,ChronoUnit.HOURS),1),UUID.randomUUID(),false,null);
+    }
+
+    @Test
+    void editaAsientosConExitoYRechazaLaOfertaActiva() {
+        OfferResponse scheduled=crearProgramada();
+        UpdateOfferRequest seatsOnly=new UpdateOfferRequest(null,null,null,null,null,List.of("4","5"),false);
+        OfferResponse changed=offerService.update(scheduled.offerId(),seatsOnly,null,true);
+        assertThat(changed.precioOferta()).isEqualByComparingTo("49900");
+        assertThat(changed.asientos()).containsExactly("4","5");
+        assertThat(changed.permiteReprogramar()).isFalse();
+        OfferResponse priceChanged=offerService.update(scheduled.offerId(),new UpdateOfferRequest(new BigDecimal("45000"),null,null,null,null,null,null),null,true);
+        assertThat(priceChanged.precioOferta()).isEqualByComparingTo("45000");
+
+        reservaConAsientos();
+        UUID activeItinerary=UUID.randomUUID(); Instant activeStart=Instant.now().plus(30,ChronoUnit.SECONDS);
+        when(catalog.itinerary(activeItinerary)).thenReturn(new CatalogClient.Itinerary(activeItinerary,companyId,new BigDecimal("95000"),"PROGRAMADO",activeStart.plus(2,ChronoUnit.DAYS)));
+        OfferResponse active=offerService.create(new CreateOfferRequest(activeItinerary,List.of("1","2"),new BigDecimal("49900"),2,activeStart,activeStart.plus(1,ChronoUnit.HOURS)),UUID.randomUUID(),false,null);
+        offerService.activate(active.offerId());
+        assertThatThrownBy(()->offerService.update(active.offerId(),seatsOnly,null,true)).extracting("code").isEqualTo("OFFER_NOT_EDITABLE");
+    }
+
+    @Test
+    void siFallaLaReservaDeAsientosAlEditarConservaLaOferta() {
+        OfferResponse scheduled=crearProgramada();
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenThrow(ApiException.unavailable("SEAT_INVENTORY_UNAVAILABLE","caído"))
+                .thenReturn(new SeatInventoryClient.OfferSeats(scheduled.offerId(),itineraryId,List.of("1","2","3"),List.of()));
+        UpdateOfferRequest update=new UpdateOfferRequest(new BigDecimal("45000"),2,1,scheduled.inicio(),scheduled.fin(),List.of("4","5"),false);
+        assertThatThrownBy(()->offerService.update(scheduled.offerId(),update,null,true)).extracting("code").isEqualTo("SEAT_INVENTORY_UNAVAILABLE");
+        Offer persisted=offerRepository.findById(scheduled.offerId()).orElseThrow();
+        assertThat(persisted.getPrecioOferta()).isEqualByComparingTo("49900");
+        assertThat(offerService.get(scheduled.offerId()).asientos()).containsExactly("1","2","3");
+    }
+
+    @Test
+    void cancelarOfertaProgramadaLiberaYMarcaMotivo() {
+        OfferResponse scheduled=crearProgramada();
+        var closed=offerService.cancelByOperator(scheduled.offerId(),null,true);
+        assertThat(closed.estado()).isEqualTo("CERRADA");
+        assertThat(closed.motivoCierre()).isEqualTo("CANCELADA_POR_OPERADOR");
+        verify(seatInventory).releaseOfferSeats(scheduled.offerId());
+    }
+
+    @Test
+    void otraEmpresaNoPuedeEditarNiCancelar() {
+        OfferResponse scheduled=crearProgramada();
+        UpdateOfferRequest update=new UpdateOfferRequest(new BigDecimal("45000"),2,1,scheduled.inicio(),scheduled.fin(),null,true);
+        UUID foreignCompany=UUID.randomUUID();
+        assertThatThrownBy(()->offerService.update(scheduled.offerId(),update,foreignCompany,false)).extracting("code").isEqualTo("OFFER_NOT_FOUND");
+        assertThatThrownBy(()->offerService.cancelByOperator(scheduled.offerId(),foreignCompany,false)).extracting("code").isEqualTo("OFFER_NOT_FOUND");
+    }
+
+    @Test
+    void duplicarUsaAsientosLibresCuandoLosOriginalesEstanOcupados() {
+        OfferResponse original=crearProgramada();
+        UUID target=UUID.randomUUID();
+        when(catalog.itinerary(target)).thenReturn(new CatalogClient.Itinerary(target,companyId,new BigDecimal("190000"),"PROGRAMADO",Instant.now().plus(2,ChronoUnit.DAYS),"Bogotá","Cali","Bus Co"));
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenAnswer(inv->{
+            List<String> asked=inv.getArgument(2);
+            return new SeatInventoryClient.OfferSeats(inv.getArgument(0),inv.getArgument(1),asked.isEmpty()?List.of("A1","A2"):List.of(),asked.isEmpty()?List.of():asked);
+        });
+        Instant start=Instant.now().plus(30,ChronoUnit.MINUTES);
+        OfferResponse copy=offerService.duplicate(original.offerId(),new DuplicateOfferRequest(target,start,start.plus(1,ChronoUnit.HOURS),null),null,true,UUID.randomUUID());
+        assertThat(copy.cupoMax()).isEqualTo(original.cupoMax());
+        assertThat(copy.maxPorUsuario()).isEqualTo(original.maxPorUsuario());
+        assertThat(copy.asientos()).containsExactly("A1","A2");
+        assertThat(copy.precioOferta()).isEqualByComparingTo("99800.00");
+    }
+
+    @Test
+    void rellenaDatosAntiguosYRecortaFinAlReprogramarseElViaje() {
+        Instant now=Instant.now();
+        Offer old=new Offer(itineraryId,new BigDecimal("49900"),2,now.plusSeconds(60),now.plusSeconds(3600),UUID.randomUUID(),now);
+        old.asignarAsientos(List.of("1","2"));old.programar();offerRepository.saveAndFlush(old);
+        when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId,companyId,new BigDecimal("95000"),"PROGRAMADO",now.plusSeconds(7200),"Bogotá","Cali","Bus Co"));
+        offerService.backfillItineraryDetails();
+        Offer updated=offerRepository.findById(old.getId()).orElseThrow();
+        assertThat(updated.getOrigen()).isEqualTo("Bogotá");
+        assertThat(updated.getDestino()).isEqualTo("Cali");
+        Instant departure=now.plusSeconds(1800).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        offerService.onItineraryRescheduled(itineraryId,departure);
+        assertThat(offerRepository.findById(old.getId()).orElseThrow().getFin()).isEqualTo(departure.truncatedTo(java.time.temporal.ChronoUnit.MICROS));
+    }
+
+    @Test
+    void vitrinaFiltraSinTildesYOrdenaActivasAntesDeProgramadas() {
+        reservaConAsientos();
+        Instant start=Instant.now().plusSeconds(60),end=start.plus(1,ChronoUnit.HOURS);
+        when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId,companyId,new BigDecimal("95000"),"PROGRAMADO",end.plusSeconds(7200),"ÁguilaNorte","CaliDestino","Bus Co"));
+        OfferResponse active=offerService.create(new CreateOfferRequest(itineraryId,List.of("1","2"),new BigDecimal("49900"),2,start,end),UUID.randomUUID(),false,null);
+        offerService.activate(active.offerId());
+        UUID nextItinerary=UUID.randomUUID();
+        when(catalog.itinerary(nextItinerary)).thenReturn(new CatalogClient.Itinerary(nextItinerary,companyId,new BigDecimal("95000"),"PROGRAMADO",end.plusSeconds(7200),"ÁguilaNorte","CaliDestino","Bus Co"));
+        OfferResponse scheduled=offerService.create(new CreateOfferRequest(nextItinerary,List.of("3","4"),new BigDecimal("49900"),2,start.plusSeconds(120),end.plusSeconds(120)),UUID.randomUUID(),false,null);
+        var page=offerService.showcase("aguilanorte","calidestino",0,20);
+        assertThat(page.getContent()).extracting(OfferService.ShowcaseOffer::offerId).containsExactly(active.offerId(),scheduled.offerId());
+        assertThat(offerService.showcase("águilanorte","medellín",0,20).getContent()).isEmpty();
     }
 }

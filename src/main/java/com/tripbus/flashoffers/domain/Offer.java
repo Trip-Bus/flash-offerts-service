@@ -31,6 +31,14 @@ public class Offer {
     @Column(name = "itinerary_id", nullable = false)
     private UUID itineraryId;
 
+    @Column(name = "company_id") private UUID companyId;
+    private String origen;
+    private String destino;
+    @Column(name = "fecha_salida") private Instant fechaSalida;
+    @Column(name = "precio_base") private BigDecimal precioBase;
+    @Column(name = "empresa_nombre") private String empresaNombre;
+    @Column(name = "permite_reprogramar", nullable = false) private boolean permiteReprogramar = true;
+
     @Column(name = "precio_oferta", nullable = false)
     private BigDecimal precioOferta;
 
@@ -137,6 +145,23 @@ public class Offer {
         this.estado = OfferStatus.CERRADA;
         this.motivoCierre = motivo;
     }
+
+    public void datosViaje(UUID companyId, String origen, String destino, Instant salida, BigDecimal base,
+                           String empresa, boolean permiteReprogramar) {
+        this.companyId = companyId; this.origen = origen; this.destino = destino; this.fechaSalida = salida;
+        this.precioBase = base; this.empresaNombre = empresa; this.permiteReprogramar = permiteReprogramar;
+    }
+
+    public void editar(BigDecimal precio, int cupo, int maxUsuario, Instant inicio, Instant fin,
+                       List<String> seats, boolean reprogramar) {
+        this.precioOferta=precio; this.cupoMax=cupo; this.maxPorUsuario=maxUsuario;
+        this.inicio=inicio; this.fin=fin; this.permiteReprogramar=reprogramar;
+        this.asientos.clear(); this.asientos.addAll(seats);
+    }
+    public void reprogramarViaje(Instant salida) { this.fechaSalida=salida; if (fin.isAfter(salida)) this.fin=salida; }
+    public UUID getCompanyId(){return companyId;} public String getOrigen(){return origen;} public String getDestino(){return destino;}
+    public Instant getFechaSalida(){return fechaSalida;} public BigDecimal getPrecioBase(){return precioBase;}
+    public String getEmpresaNombre(){return empresaNombre;} public boolean isPermiteReprogramar(){return permiteReprogramar;}
 
     public UUID getId() {
         return id;
