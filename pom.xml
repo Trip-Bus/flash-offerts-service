@@ -67,6 +67,8 @@
             **/web/dto/QuotaResponse.java,
             **/web/dto/ReservationResponse.java,
             **/web/dto/ReserveRequest.java,
+            **/web/dto/UpdateOfferRequest.java,
+            **/web/dto/DuplicateOfferRequest.java,
             **/common/events/EventEnvelope.java,
             **/common/events/ProcessedEvent.java,
             **/config/OpenApiConfig.java
@@ -239,6 +241,8 @@
                         <exclude>**/web/dto/QuotaResponse.class</exclude>
                         <exclude>**/web/dto/ReservationResponse.class</exclude>
                         <exclude>**/web/dto/ReserveRequest.class</exclude>
+                        <exclude>**/web/dto/UpdateOfferRequest.class</exclude>
+                        <exclude>**/web/dto/DuplicateOfferRequest.class</exclude>
                         <exclude>**/common/events/EventEnvelope.class</exclude>
                         <exclude>**/common/events/ProcessedEvent.class</exclude>
                         <exclude>**/config/OpenApiConfig.class</exclude>

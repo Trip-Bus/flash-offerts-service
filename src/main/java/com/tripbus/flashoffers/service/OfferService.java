@@ -12,6 +12,8 @@ import com.tripbus.flashoffers.events.OfferEvents;
 import com.tripbus.flashoffers.repository.OfferRepository;
 import com.tripbus.flashoffers.repository.OfferSaleRepository;
 import com.tripbus.flashoffers.web.dto.CreateOfferRequest;
+import com.tripbus.flashoffers.web.dto.UpdateOfferRequest;
+import com.tripbus.flashoffers.web.dto.DuplicateOfferRequest;
 import com.tripbus.flashoffers.web.dto.OfferResponse;
 import com.tripbus.flashoffers.web.dto.QuotaResponse;
 import com.tripbus.flashoffers.web.dto.ReservationResponse;
@@ -21,11 +23,13 @@ import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashSet;
@@ -36,6 +40,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.text.Normalizer;
+import java.util.Locale;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 
 /**
  * Ofertas relámpago: CreateOffer, GetOfferStatus, GetRemainingQuota, ReserveOfferSeat,
@@ -56,6 +65,8 @@ public class OfferService {
     private final TransactionTemplate tx;
     private final JdbcTemplate jdbc;
     private final Clock clock;
+    @Value("${tripbus.offers.min-discount:5}") private BigDecimal minDiscount = BigDecimal.valueOf(5);
+    @Value("${tripbus.offers.max-discount:70}") private BigDecimal maxDiscount = BigDecimal.valueOf(70);
 
     public OfferService(OfferRepository offerRepository, OfferSaleRepository saleRepository, QuotaCounter quota,
                         SeatInventoryClient seatInventory, CatalogClient catalog, EventPublisher events,
@@ -74,12 +85,20 @@ public class OfferService {
     // ------------------------------------------------------------------ CreateOffer (US-054)
 
     public OfferResponse create(CreateOfferRequest request, UUID userId, boolean isOperator, UUID operatorCompanyId) {
+        return create(request,userId,isOperator,operatorCompanyId,false,false);
+    }
+
+    private OfferResponse create(CreateOfferRequest request, UUID userId, boolean isOperator, UUID operatorCompanyId,
+                                 boolean requireFullQuota, boolean allowAutomaticSeats) {
         Instant now = clock.instant();
         List<String> seats = request.seatNumbers().stream().map(String::trim).filter(s -> !s.isEmpty()).distinct().toList();
         if (!request.fin().isAfter(request.inicio())) {
             throw ApiException.badRequest("INVALID_OFFER_WINDOW", "La hora de fin debe ser posterior a la de inicio");
         }
-        if (request.cupo() > seats.size()) {
+        if (request.inicio().isBefore(now) || Duration.between(request.inicio(), request.fin()).toMinutes() < 5) {
+            throw ApiException.badRequest("INVALID_OFFER_WINDOW", "El inicio no puede estar en el pasado y la duración mínima es de 5 minutos");
+        }
+        if (request.cupo() > seats.size() && !(requireFullQuota && seats.isEmpty())) {
             throw ApiException.badRequest("QUOTA_EXCEEDS_SEATS", "El cupo no puede ser mayor que los asientos de la oferta");
         }
         int maxPorUsuario = request.maxPorUsuario() != null
@@ -96,34 +115,58 @@ public class OfferService {
         if (itinerary.fechaSalida() != null && request.fin().isAfter(itinerary.fechaSalida())) {
             throw ApiException.badRequest("OFFER_ENDS_AFTER_DEPARTURE", "La oferta debe terminar antes de la salida del bus");
         }
-        if (request.precioOferta().compareTo(itinerary.precioBase()) >= 0) {
-            throw ApiException.badRequest("OFFER_PRICE_NOT_LOWER", "El precio de oferta debe ser menor al precio base");
+        BigDecimal discount = itinerary.precioBase().subtract(request.precioOferta()).multiply(BigDecimal.valueOf(100))
+                .divide(itinerary.precioBase(), 2, java.math.RoundingMode.HALF_UP);
+        if (discount.compareTo(minDiscount) < 0 || discount.compareTo(maxDiscount) > 0) {
+            throw ApiException.badRequest("INVALID_DISCOUNT", "El descuento debe estar entre " + minDiscount + "% y " + maxDiscount + "%");
         }
         // US-005: un operador solo puede crear ofertas para viajes de su propia empresa.
         if (isOperator && !Objects.equals(operatorCompanyId, itinerary.companyId())) {
             throw ApiException.forbidden("NOT_YOUR_COMPANY", "Solo puede crear ofertas para viajes de su empresa");
         }
-
         Offer draft = new Offer(request.itineraryId(), request.precioOferta(), request.cupo(), maxPorUsuario,
-                request.inicio().isBefore(now) ? now : request.inicio(), request.fin(), userId, now);
+                request.inicio(), request.fin(), userId, now);
+        draft.datosViaje(itinerary.companyId(), itinerary.origen(), itinerary.destino(), itinerary.fechaSalida(),
+                itinerary.precioBase(), itinerary.empresaNombre(), request.permiteReprogramar()==null || request.permiteReprogramar());
         // Se guarda como BORRADOR: el scheduler no la activa (ni se lista) hasta tener sus asientos reservados.
-        tx.executeWithoutResult(s -> offerRepository.save(draft));
+        tx.executeWithoutResult(s -> {
+            jdbc.query("select pg_advisory_xact_lock(hashtext(?))", rs -> { }, "offer-itinerary:"+request.itineraryId());
+            if(!offerRepository.findOverlaps(request.itineraryId(),request.inicio(),request.fin(),OfferStatus.CERRADA).isEmpty())
+                throw ApiException.conflict("OFFER_OVERLAP", "Ya existe una oferta en una ventana que se cruza con este viaje");
+            offerRepository.save(draft);
+        });
 
         SeatInventoryClient.OfferSeats reserved;
         try {
             reserved = seatInventory.reserveOfferSeats(draft.getId(), draft.getItineraryId(), seats);
         } catch (RuntimeException e) {
+            if(requireFullQuota && allowAutomaticSeats && !seats.isEmpty()) {
+                try { seatInventory.releaseOfferSeats(draft.getId()); reserved=seatInventory.reserveOfferSeats(draft.getId(),draft.getItineraryId(),List.of()); }
+                catch(RuntimeException fallbackFailure){discardDraft(draft.getId());throw e;}
+            } else {
             // Puede ser un timeout con la reserva ya hecha en Seat Inventory: se liberan por si acaso.
             discardDraft(draft.getId());
             throw e;
+            }
+        }
+        if(requireFullQuota && allowAutomaticSeats && (reserved==null || reserved.reservados()==null || reserved.reservados().size()<request.cupo())) {
+            try { seatInventory.releaseOfferSeats(draft.getId()); reserved=seatInventory.reserveOfferSeats(draft.getId(),draft.getItineraryId(),List.of()); }
+            catch(RuntimeException e){discardDraft(draft.getId());throw e;}
+            if(reserved==null || reserved.reservados()==null || reserved.reservados().size()<request.cupo()){
+                discardDraft(draft.getId());throw ApiException.conflict("NO_SEATS_AVAILABLE","No hay suficientes asientos disponibles para duplicar la oferta");
+            }
+        }
+        if(requireFullQuota && (reserved==null || reserved.reservados()==null || reserved.reservados().size()<request.cupo())) {
+            discardDraft(draft.getId());throw ApiException.conflict("NO_SEATS_AVAILABLE","No hay suficientes asientos disponibles para duplicar la oferta");
         }
         if (reserved == null || reserved.reservados() == null || reserved.reservados().isEmpty()) {
             discardDraft(draft.getId());
             throw ApiException.conflict("NO_SEATS_AVAILABLE", "Ninguno de los asientos indicados está disponible");
         }
+        List<String> reservedSeats=reserved.reservados();
 
         try {
-            tx.executeWithoutResult(s -> scheduleDraft(draft.getId(), reserved.reservados()));
+            tx.executeWithoutResult(s -> scheduleDraft(draft.getId(), reservedSeats));
         } catch (RuntimeException e) {
             discardDraft(draft.getId());
             throw e;
@@ -150,6 +193,7 @@ public class OfferService {
         payload.put("cupoMax", offer.getCupoMax());
         payload.put("inicio", offer.getInicio());
         payload.put("fin", offer.getFin());
+        payload.put("origen", offer.getOrigen()); payload.put("destino", offer.getDestino());
         events.publishAfterCommit(OfferEvents.OFFER_CREATED, payload);
     }
 
@@ -204,6 +248,7 @@ public class OfferService {
         payload.put("itineraryId", offer.getItineraryId());
         payload.put("precioOferta", offer.getPrecioOferta());
         payload.put("fin", offer.getFin());
+        payload.put("origen", offer.getOrigen()); payload.put("destino", offer.getDestino());
         payload.put("timestamp", clock.instant());
         events.publishAfterCommit(OfferEvents.OFFER_ACTIVATED, payload);
         events.publishAfterCommit(OfferEvents.OFFER_QUOTA_UPDATED, quotaPayload(offer.getId(), remaining(offer)));
@@ -223,6 +268,7 @@ public class OfferService {
         payload.put("offerId", offer.getId());
         payload.put("itineraryId", offer.getItineraryId());
         payload.put("motivo", motivo);
+        payload.put("origen", offer.getOrigen()); payload.put("destino", offer.getDestino());
         events.publishAfterCommit(OfferEvents.OFFER_CLOSED, payload);
         try {
             quota.delete(offerId);
@@ -347,7 +393,7 @@ public class OfferService {
             if (o.getEstado() == OfferStatus.ACTIVA) {
                 o.agotar();
                 events.publishAfterCommit(OfferEvents.OFFER_SOLD_OUT,
-                        Map.of("offerId", offerId, "itineraryId", o.getItineraryId(), "timestamp", clock.instant()));
+                        Map.of("offerId", offerId, "itineraryId", o.getItineraryId(), "origen",Objects.toString(o.getOrigen(),""),"destino",Objects.toString(o.getDestino(),""), "timestamp", clock.instant()));
             }
         }));
     }
@@ -380,6 +426,7 @@ public class OfferService {
                 payload.put("itineraryId", o.getItineraryId());
                 payload.put("precioOferta", o.getPrecioOferta());
                 payload.put("fin", o.getFin());
+                payload.put("origen", o.getOrigen()); payload.put("destino", o.getDestino());
                 payload.put("timestamp", clock.instant());
                 events.publishAfterCommit(OfferEvents.OFFER_ACTIVATED, payload);
             }
@@ -397,6 +444,28 @@ public class OfferService {
         for (UUID offerId : offerRepository.findIdsByItineraryIdAndEstadoNot(itineraryId, OfferStatus.CERRADA)) {
             close(offerId, "ITINERARIO_CANCELADO");
         }
+    }
+
+    @Transactional
+    public void onItineraryRescheduled(UUID itineraryId, Instant newDeparture) {
+        offerRepository.findByItineraryIdAndEstadoNotOrderByInicioDesc(itineraryId,OfferStatus.CERRADA).forEach(o->{
+            o.reprogramarViaje(newDeparture);
+            Map<String,Object> p=new LinkedHashMap<>();p.put("offerId",o.getId());p.put("itineraryId",itineraryId);p.put("origen",o.getOrigen());p.put("destino",o.getDestino());p.put("fechaSalida",newDeparture);p.put("fin",o.getFin());p.put("timestamp",clock.instant());events.publishAfterCommit(OfferEvents.OFFER_UPDATED,p);
+        });
+    }
+
+    @Transactional
+    public void backfillItineraryDetails() {
+        Set<UUID> ids=new HashSet<>(); offerRepository.findByCompanyIdIsNull().forEach(o->ids.add(o.getItineraryId()));
+        for(UUID id:ids) { try { CatalogClient.Itinerary i=catalog.itinerary(id); offerRepository.findByItineraryIdAndEstadoNotOrderByInicioDesc(id,OfferStatus.BORRADOR).forEach(o->o.datosViaje(i.companyId(),i.origen(),i.destino(),i.fechaSalida(),i.precioBase(),i.empresaNombre(),o.isPermiteReprogramar())); }
+            catch(RuntimeException e){log.warn("No se pudo completar datos del itinerario {} desde catalog; se reintentará en el próximo arranque",id);} }
+    }
+
+    @Transactional
+    public OfferResponse cancelByOperator(UUID id, UUID company, boolean admin) {
+        Offer o=offerRepository.findById(id).orElseThrow(()->ApiException.notFound("OFFER_NOT_FOUND","La oferta no existe"));checkCompany(o,company,admin);
+        if(o.getEstado()!=OfferStatus.PROGRAMADA||!o.getInicio().isAfter(clock.instant()))throw ApiException.conflict("OFFER_NOT_CANCELLABLE","Solo se cancelan ofertas programadas antes del inicio");
+        seatInventory.releaseOfferSeats(id); close(id,"CANCELADA_POR_OPERADOR"); return get(id);
     }
 
     // ------------------------------------------------------------------ consultas
@@ -432,6 +501,81 @@ public class OfferService {
                         "No hay una reserva de oferta viva para esa retención"));
         return toReservation(sale, offer);
     }
+
+    public record ShowcaseOffer(UUID offerId, UUID itineraryId, String empresa, String origen, String destino,
+            Instant fechaSalida, BigDecimal precioBase, BigDecimal precioOferta, BigDecimal descuentoPorcentaje,
+            int cupoRestante, Instant inicio, Instant fin, long segundosRestantes, String estado) { }
+    public record OperatorOffer(OfferResponse oferta, int cupoVendido, int cupoRestante) { }
+
+    @Transactional(readOnly = true)
+    public Page<ShowcaseOffer> showcase(String origin, String destination, int page, int size) {
+        Instant now=clock.instant(), limit=now.plus(Duration.ofHours(48));
+        List<Offer> candidates=offerRepository.findByEstadoInOrderByInicioAsc(List.of(OfferStatus.ACTIVA, OfferStatus.PROGRAMADA))
+                .stream().filter(o -> o.getEstado()==OfferStatus.ACTIVA ? o.getFin().isAfter(now) : !o.getInicio().isBefore(now) && !o.getInicio().isAfter(limit))
+                .filter(o -> origin==null || normalized(o.getOrigen()).contains(normalized(origin)))
+                .filter(o -> destination==null || normalized(o.getDestino()).contains(normalized(destination)))
+                .sorted(java.util.Comparator.comparingInt((Offer o)->o.getEstado()==OfferStatus.ACTIVA?0:1)
+                        .thenComparing(o->o.getEstado()==OfferStatus.ACTIVA?o.getFin():o.getInicio())).toList();
+        List<ShowcaseOffer> all=candidates.stream().map(o -> new ShowcaseOffer(o.getId(),o.getItineraryId(),o.getEmpresaNombre(),o.getOrigen(),o.getDestino(),o.getFechaSalida(),o.getPrecioBase(),o.getPrecioOferta(),
+                o.getPrecioBase()==null||o.getPrecioBase().signum()==0?BigDecimal.ZERO:o.getPrecioBase().subtract(o.getPrecioOferta()).multiply(BigDecimal.valueOf(100)).divide(o.getPrecioBase(),2,java.math.RoundingMode.HALF_UP),remaining(o),o.getInicio(),o.getFin(),secondsLeft(o),o.getEstado().name())).toList();
+        int from=Math.min(page*size,all.size()), to=Math.min(from+size,all.size());
+        return new PageImpl<>(all.subList(from,to),PageRequest.of(page,size),all.size());
+    }
+
+    private static String normalized(String s) { return s==null?"":Normalizer.normalize(s,Normalizer.Form.NFD).replaceAll("\\p{M}+","").toLowerCase(Locale.ROOT); }
+
+    @Transactional(readOnly = true)
+    public Page<OperatorOffer> operatorOffers(String estado, Instant desde, Instant hasta, int page, int size, UUID company, boolean admin) {
+        List<Offer> all=(admin?offerRepository.findAll():offerRepository.findByCompanyId(company)).stream()
+                .filter(o->!o.borrador()).filter(o->estado==null||o.getEstado().name().equalsIgnoreCase(estado))
+                .filter(o->desde==null||!o.getInicio().isBefore(desde)).filter(o->hasta==null||!o.getInicio().isAfter(hasta))
+                .sorted(java.util.Comparator.comparing(Offer::getInicio).reversed()).toList();
+        int from=Math.min(page*size,all.size()),to=Math.min(from+size,all.size());
+        return new PageImpl<>(all.subList(from,to).stream().map(o->{int left=remaining(o);return new OperatorOffer(toResponse(o),Math.max(0,o.getCupoMax()-left),left);}).toList(),PageRequest.of(page,size),all.size());
+    }
+
+    @Transactional
+    public OfferResponse update(UUID id, UpdateOfferRequest req, UUID company, boolean admin) {
+        Offer offer=offerRepository.findById(id).orElseThrow(()->ApiException.notFound("OFFER_NOT_FOUND","La oferta no existe"));
+        checkCompany(offer,company,admin);
+        Instant now=clock.instant();
+        if(offer.getEstado()!=OfferStatus.PROGRAMADA || !offer.getInicio().isAfter(now)) throw ApiException.conflict("OFFER_NOT_EDITABLE","Solo se editan ofertas programadas antes de iniciar");
+        Instant inicio=req.inicio()==null?offer.getInicio():req.inicio(), fin=req.fin()==null?offer.getFin():req.fin();
+        BigDecimal precio=req.precioOferta()==null?offer.getPrecioOferta():req.precioOferta();
+        List<String> seats=req.seatNumbers()==null?List.copyOf(offer.getAsientos()):req.seatNumbers().stream().map(String::trim).filter(s->!s.isEmpty()).distinct().toList();
+        BigDecimal discount=offer.getPrecioBase().subtract(precio).multiply(BigDecimal.valueOf(100)).divide(offer.getPrecioBase(),2,java.math.RoundingMode.HALF_UP);
+        int quotaCount=req.cupo()==null?offer.getCupoMax():req.cupo(), maxUser=req.maxPorUsuario()==null?Math.min(offer.getMaxPorUsuario(),quotaCount):req.maxPorUsuario();
+        validateWindow(inicio,fin,now);
+        if(discount.compareTo(minDiscount)<0||discount.compareTo(maxDiscount)>0) throw ApiException.badRequest("INVALID_DISCOUNT","Descuento fuera del rango permitido");
+        if(quotaCount>seats.size()||maxUser>quotaCount) throw ApiException.badRequest("QUOTA_EXCEEDS_SEATS","Cupo o máximo por usuario inválido");
+        if(!offerRepository.findOverlaps(offer.getItineraryId(),inicio,fin,OfferStatus.CERRADA).stream().filter(o->!o.getId().equals(id)).toList().isEmpty()) throw ApiException.conflict("OFFER_OVERLAP","Ventana cruzada");
+        if(offer.getFechaSalida()!=null&&fin.isAfter(offer.getFechaSalida()))throw ApiException.badRequest("OFFER_ENDS_AFTER_DEPARTURE","La oferta debe terminar antes de la salida");
+        boolean changed=!offer.getAsientos().equals(seats);
+        List<String> oldSeats=List.copyOf(offer.getAsientos());
+        if(changed){ seatInventory.releaseOfferSeats(id); try { var reserve=seatInventory.reserveOfferSeats(id,offer.getItineraryId(),seats); if(reserve==null||reserve.reservados()==null||reserve.reservados().size()<quotaCount) throw ApiException.conflict("NO_SEATS_AVAILABLE","No se pudieron reservar los asientos nuevos"); seats=reserve.reservados(); } catch(RuntimeException ex){ try{seatInventory.releaseOfferSeats(id);seatInventory.reserveOfferSeats(id,offer.getItineraryId(),oldSeats);}catch(RuntimeException ignored){} throw ex; } }
+        List<String> chosen=seats;
+        try { tx.executeWithoutResult(s->{Offer locked=offerRepository.lockById(id).orElseThrow(); if(locked.getEstado()!=OfferStatus.PROGRAMADA||!locked.getInicio().isAfter(clock.instant()))throw ApiException.conflict("OFFER_NOT_EDITABLE","Oferta no editable"); locked.editar(precio,quotaCount,maxUser,inicio,fin,chosen,req.permiteReprogramar()==null?locked.isPermiteReprogramar():req.permiteReprogramar()); }); }
+        catch(RuntimeException ex){if(changed)try{seatInventory.releaseOfferSeats(id);seatInventory.reserveOfferSeats(id,offer.getItineraryId(),oldSeats);}catch(RuntimeException ignored){}throw ex;}
+        if(changed && quota.isInitialized(id)){quota.delete(id);quota.initialize(id,quotaCount,chosen);}
+        Map<String,Object> event=new LinkedHashMap<>(); event.put("offerId",id);event.put("itineraryId",offer.getItineraryId());event.put("origen",offer.getOrigen());event.put("destino",offer.getDestino());event.put("precioOferta",precio);event.put("timestamp",now);events.publishSafely(OfferEvents.OFFER_UPDATED,event);
+        return get(id);
+    }
+
+    @Transactional
+    public OfferResponse duplicate(UUID id, DuplicateOfferRequest req, UUID company, boolean admin, UUID userId) {
+        Offer original=offerRepository.findById(id).orElseThrow(()->ApiException.notFound("OFFER_NOT_FOUND","La oferta no existe")); checkCompany(original,company,admin);
+        CatalogClient.Itinerary target=catalog.itinerary(req.itineraryId()); if(!Objects.equals(original.getCompanyId(),target.companyId()))throw ApiException.notFound("ITINERARY_NOT_FOUND","El itinerario no existe"); checkCompanyId(target.companyId(),company,admin);
+        BigDecimal price=target.precioBase().multiply(original.getPrecioOferta()).divide(original.getPrecioBase(),2,java.math.RoundingMode.HALF_UP);
+        List<String> seats=req.seatNumbers()==null?original.getAsientos():req.seatNumbers();
+        return create(new CreateOfferRequest(req.itineraryId(),seats,price,original.getCupoMax(),req.inicio(),req.fin(),original.getMaxPorUsuario(),original.isPermiteReprogramar()),userId,false,company,true,req.seatNumbers()==null);
+    }
+
+    private void checkCompany(Offer o, UUID company, boolean admin){if(!admin&&!Objects.equals(company,o.getCompanyId()))throw ApiException.notFound("OFFER_NOT_FOUND","La oferta no existe");}
+    private void checkCompanyId(UUID actual, UUID company, boolean admin){if(!admin&&!Objects.equals(company,actual))throw ApiException.notFound("ITINERARY_NOT_FOUND","El itinerario no existe");}
+    private static void validateWindow(Instant start,Instant end,Instant now){if(start.isBefore(now)||Duration.between(start,end).toMinutes()<5)throw ApiException.badRequest("INVALID_OFFER_WINDOW","Inicio o duración inválidos");}
+
+    @Transactional(readOnly = true)
+    public Map<String,Object> internalDetails(UUID id){Offer o=findVisible(id);Map<String,Object> details=new LinkedHashMap<>();details.put("offerId",o.getId());details.put("itineraryId",o.getItineraryId());details.put("companyId",o.getCompanyId());details.put("precioOferta",o.getPrecioOferta());details.put("precioBase",o.getPrecioBase());details.put("permiteReprogramar",o.isPermiteReprogramar());return details;}
 
     // ------------------------------------------------------------------ utilidades
 
@@ -520,7 +664,7 @@ public class OfferService {
     private OfferResponse toResponse(Offer offer) {
         return new OfferResponse(offer.getId(), offer.getItineraryId(), offer.getPrecioOferta(), offer.getCupoMax(),
                 offer.getMaxPorUsuario(), remaining(offer), offer.getInicio(), offer.getFin(), offer.getEstado().name(), secondsLeft(offer),
-                List.copyOf(offer.getAsientos()), offer.getMotivoCierre());
+                List.copyOf(offer.getAsientos()), offer.getMotivoCierre(),offer.isPermiteReprogramar());
     }
 
     private static ReservationResponse toReservation(OfferSale sale, Offer offer) {

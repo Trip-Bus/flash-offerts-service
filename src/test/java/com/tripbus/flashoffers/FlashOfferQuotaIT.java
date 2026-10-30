@@ -83,10 +83,11 @@ class FlashOfferQuotaIT {
     private CatalogClient catalog;
 
     private final UUID companyId = UUID.randomUUID();
-    private final UUID itineraryId = UUID.randomUUID();
+    private UUID itineraryId;
 
     @BeforeEach
     void simular() {
+        itineraryId=UUID.randomUUID();
         when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId, companyId,
                 new BigDecimal("95000"), "PROGRAMADO", Instant.now().plus(2, ChronoUnit.DAYS)));
         when(seatInventory.reserveOfferSeats(any(), any(), anyList())).thenAnswer(inv ->
@@ -98,8 +99,11 @@ class FlashOfferQuotaIT {
 
     private OfferResponse nuevaOferta(int cupo) {
         List<String> asientos = IntStream.rangeClosed(1, cupo).mapToObj(String::valueOf).toList();
-        return offerService.create(new CreateOfferRequest(itineraryId, asientos, new BigDecimal("49900"), cupo,
-                Instant.now(), Instant.now().plus(1, ChronoUnit.HOURS)), UUID.randomUUID(), false, null);
+        Instant start=Instant.now().plus(30,ChronoUnit.SECONDS);
+        OfferResponse created=offerService.create(new CreateOfferRequest(itineraryId, asientos, new BigDecimal("49900"), cupo,
+                start, start.plus(1, ChronoUnit.HOURS)), UUID.randomUUID(), false, null);
+        offerService.activate(created.offerId());
+        return offerService.get(created.offerId());
     }
 
     @Test
@@ -177,17 +181,30 @@ class FlashOfferQuotaIT {
 
     @Test
     void unOperadorNoPuedeCrearOfertasDeOtraEmpresa() {
+        Instant start=Instant.now().plusSeconds(30);
         assertThatThrownBy(() -> offerService.create(new CreateOfferRequest(itineraryId, List.of("1"),
-                new BigDecimal("49900"), 1, Instant.now(), Instant.now().plus(1, ChronoUnit.HOURS)),
+                new BigDecimal("49900"), 1, start, start.plus(1, ChronoUnit.HOURS)),
                 UUID.randomUUID(), true, UUID.randomUUID()))
                 .extracting("code").isEqualTo("NOT_YOUR_COMPANY");
     }
 
     @Test
     void elPrecioDeOfertaDebeSerMenorAlBase() {
+        Instant start=Instant.now().plusSeconds(30);
         assertThatThrownBy(() -> offerService.create(new CreateOfferRequest(itineraryId, List.of("1"),
-                new BigDecimal("95000"), 1, Instant.now(), Instant.now().plus(1, ChronoUnit.HOURS)),
+                new BigDecimal("95000"), 1, start, start.plus(1, ChronoUnit.HOURS)),
                 UUID.randomUUID(), false, null))
-                .extracting("code").isEqualTo("OFFER_PRICE_NOT_LOWER");
+                .extracting("code").isEqualTo("INVALID_DISCOUNT");
+    }
+
+    @Test
+    void rechazaDescuentoFueraDelRangoYVentanasCruzadas() {
+        Instant start=Instant.now().plusSeconds(60), end=start.plus(1,ChronoUnit.HOURS);
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),new BigDecimal("94000"),1,start,end),UUID.randomUUID(),false,null))
+                .extracting("code").isEqualTo("INVALID_DISCOUNT");
+        OfferResponse first=offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),new BigDecimal("49900"),1,start,end),UUID.randomUUID(),false,null);
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("2"),new BigDecimal("49900"),1,start.plusSeconds(30),end.plusSeconds(30)),UUID.randomUUID(),false,null))
+                .extracting("code").isEqualTo("OFFER_OVERLAP");
+        assertThat(offerService.get(first.offerId()).estado()).isEqualTo("PROGRAMADA");
     }
 }

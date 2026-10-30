@@ -8,6 +8,7 @@ RUN mvn -B -q package -DskipTests
 
 # ---- Etapa 2: imagen de ejecución (solo JRE) ----
 FROM eclipse-temurin:21-jre-alpine
+RUN apk upgrade --no-cache
 RUN addgroup -S tripbus && adduser -S tripbus -G tripbus
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar

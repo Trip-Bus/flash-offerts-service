@@ -23,6 +23,20 @@ Ofertas relámpago: creación con cupo y horario, contador atómico de cupo, ven
 | GET | `/offers/{id}/quota` | GetRemainingQuota + segundos restantes (público) |
 | POST | `/offers/{id}/reservations` `{docId}` | ReserveOfferSeat → retención del asiento (luego se compra con `POST /bookings`) |
 | POST | `/offers/{id}/activate` · `/offers/{id}/close` | ActivateOffer / CloseOffer (OPERADOR o ADMIN) |
+| GET | `/offers/showcase?origin=&destination=&page=&size=` | Vitrina pública en las próximas 48 h |
+| GET | `/operator/offers?estado=&desde=&hasta=&page=&size=` | Gestión paginada por empresa (OPERADOR) o global (ADMIN) |
+| PUT | `/offers/{id}` | Edita oferta PROGRAMADA antes del inicio; admite precio, cupo, límite, ventana, asientos y `permiteReprogramar` |
+| DELETE | `/offers/{id}` | Cancela una oferta PROGRAMADA y libera sus asientos |
+| POST | `/offers/{id}/duplicate` `{itineraryId,inicio,fin,seatNumbers?}` | Duplica descuento y cupos en otro viaje de la misma empresa |
+| GET | `/internal/offers/{id}` | Precio base/oferta y regla de reprogramación (X-Internal-Token) |
+
+Crear y editar validan descuento configurable entre `tripbus.offers.min-discount` (5 %) y
+`tripbus.offers.max-discount` (70 %), inicio no pasado, ventana mínima de cinco minutos y ausencia
+de ventanas cruzadas para un mismo viaje. La oferta conserva empresa, ruta y salida consultadas a
+Catalog. Las ofertas antiguas se completan al arrancar; si Catalog no responde se reintenta al próximo
+arranque. `ItineraryRescheduled` actualiza la salida y recorta el fin de la oferta cuando haga falta.
+La vitrina normaliza tildes, ordena ACTIVA por fin y luego PROGRAMADA por inicio, y usa PostgreSQL
+para calcular cupo si Redis no está disponible. `permiteReprogramar` es verdadero por defecto.
 
 ### Nunca vender más que el cupo
 
@@ -31,8 +45,10 @@ rechaza (409 `OUT_OF_STOCK`), si no toma un asiento de la lista de la oferta. Id
 `(offerId, userId, docId)`. Si una retención de oferta expira, el cupo vuelve. Activación y cierre
 automáticos por horario (un solo nodo).
 
-**Publica:** `OfferCreated`, `OfferActivated`, `OfferClosed`, `OfferSoldOut`, `OfferQuotaUpdated`.
-**Consume:** `SeatSold`, `SeatReleased`, `HoldExpired`, `ItineraryCancelled`.
+**Publica:** `OfferCreated`, `OfferActivated`, `OfferClosed`, `OfferSoldOut`, `OfferUpdated`,
+`OfferQuotaUpdated`. Los eventos de activación, cierre, agotamiento y actualización incluyen `origen`
+y `destino` para la vitrina en tiempo real.
+**Consume:** `SeatSold`, `SeatReleased`, `HoldExpired`, `ItineraryCancelled`, `ItineraryRescheduled`.
 
 Prueba US-058: `FlashOfferQuotaIT` — 1.000 solicitudes concurrentes, cupo 20 → exactamente 20 ventas
 y el contador nunca baja de 0. Es un **gate**: corre en cada CI.
@@ -205,7 +221,8 @@ subirlos son `OfferController`, `SeatInventoryClient`, `CatalogClient`, `EventCo
 
 Fuera de la cobertura (mismas en `sonar.coverage.exclusions` y en los `<excludes>` de JaCoCo) solo
 está lo que no tiene lógica: `FlashOffersApplication`, los records de `web/dto` (`CreateOfferRequest`,
-`OfferResponse`, `QuotaResponse`, `ReservationResponse`, `ReserveRequest`), `EventEnvelope`, la
+`OfferResponse`, `QuotaResponse`, `ReservationResponse`, `ReserveRequest`, `UpdateOfferRequest`,
+`DuplicateOfferRequest`), `EventEnvelope`, la
 entidad de solo getters `ProcessedEvent` y `config/OpenApiConfig`. `Offer`, `OfferSale`,
 `ErrorResponse` y `EventProperties` tienen lógica y **sí** cuentan.
 

@@ -35,10 +35,15 @@ public record CreateOfferRequest(
 
         // US-058: opcional; si no viene, 2 (o el cupo, si es menor).
         @Positive(message = "El máximo por usuario debe ser positivo")
-        Integer maxPorUsuario) {
+        Integer maxPorUsuario,
+        Boolean permiteReprogramar) {
 
     public CreateOfferRequest(UUID itineraryId, List<String> seatNumbers, BigDecimal precioOferta, Integer cupo,
                               Instant inicio, Instant fin) {
-        this(itineraryId, seatNumbers, precioOferta, cupo, inicio, fin, null);
+        this(itineraryId, seatNumbers, precioOferta, cupo, inicio, fin, null, null);
+    }
+    public CreateOfferRequest(UUID itineraryId, List<String> seatNumbers, BigDecimal precioOferta, Integer cupo,
+                              Instant inicio, Instant fin, Integer maxPorUsuario) {
+        this(itineraryId,seatNumbers,precioOferta,cupo,inicio,fin,maxPorUsuario,null);
     }
 }
