@@ -26,4 +26,13 @@ class OperatorOfferControllerTest {
   new OperatorOfferController(service).list(null,null,null,-1,1000,auth);
   verify(service).operatorOffers(null,null,null,0,100,null,true);
  }
+ @Test void metricasDelOperadorConSuEmpresa(){
+  OfferService service=mock(OfferService.class); UUID company=UUID.randomUUID();
+  Jwt jwt=Jwt.withTokenValue("t").header("alg","none").subject(UUID.randomUUID().toString()).claim("companyId",company.toString()).build();
+  var auth=new JwtAuthenticationToken(jwt,List.of(new SimpleGrantedAuthority("ROLE_OPERADOR")));
+  java.time.Instant desde=java.time.Instant.parse("2026-10-01T00:00:00Z"),hasta=desde.plusSeconds(86400);
+  var metrics=new OfferService.OperatorMetrics(1,1,java.math.BigDecimal.TEN,java.math.BigDecimal.ONE,java.math.BigDecimal.ONE,null);
+  when(service.operatorMetrics(desde,hasta,company,false)).thenReturn(metrics);
+  assertThat(new OperatorOfferController(service).metrics(desde,hasta,auth)).isSameAs(metrics);
+ }
 }

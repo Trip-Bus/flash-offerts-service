@@ -452,6 +452,45 @@ class OfferDraftIT {
     }
 
     @Test
+    void metricasDeOfertaYDeOperadorSoloVenLaEmpresaPropia() {
+        UUID company=UUID.randomUUID();
+        when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId,company,new BigDecimal("95000"),"PROGRAMADO",Instant.now().plus(2,ChronoUnit.DAYS)));
+        reservaConAsientos();
+        when(seatInventory.hold(any(), anyString(), any(), any())).thenAnswer(inv ->
+                new SeatInventoryClient.Hold(UUID.randomUUID(), inv.getArgument(0), List.of((String) inv.getArgument(1)),
+                        inv.getArgument(2), inv.getArgument(3), "ACTIVA", Instant.now().plusSeconds(600)));
+        OfferResponse offer=crear();
+
+        var empty=offerService.metrics(offer.offerId(),company,false);
+        assertThat(empty.cupo()).isEqualTo(3);
+        assertThat(empty.reservasCreadas()).isZero();
+        assertThat(empty.conversion()).isEqualByComparingTo("0");
+        assertThat(empty.tiempoEnAgotarseSegundos()).isNull();
+
+        var reserva=offerService.reserve(offer.offerId(),UUID.randomUUID(),"CC1").reservation();
+        offerService.onSeatSold(reserva.holdId());
+        var sold=offerService.metrics(offer.offerId(),null,true);
+        assertThat(sold.reservasCreadas()).isEqualTo(1);
+        assertThat(sold.ventas()).isEqualTo(1);
+        assertThat(sold.conversion()).isEqualByComparingTo("1");
+        assertThat(sold.ingresos()).isEqualByComparingTo("49900");
+        assertThat(sold.descuentoTotalOtorgado()).isEqualByComparingTo("45100");
+        assertThatThrownBy(()->offerService.metrics(offer.offerId(),UUID.randomUUID(),false)).extracting("code").isEqualTo("OFFER_NOT_FOUND");
+
+        Instant desde=Instant.now().minus(1,ChronoUnit.HOURS),hasta=Instant.now().plus(1,ChronoUnit.DAYS);
+        var own=offerService.operatorMetrics(desde,hasta,company,false);
+        assertThat(own.ofertas()).isEqualTo(1);
+        assertThat(own.ventas()).isEqualTo(1);
+        assertThat(own.ingresos()).isEqualByComparingTo("49900");
+        assertThat(own.ofertaAgotadaMasRapido()).isEqualTo(offer.offerId());
+        assertThat(offerService.operatorMetrics(desde,hasta,UUID.randomUUID(),false).ofertas()).isZero();
+        assertThat(offerService.operatorMetrics(desde,hasta,null,true).ofertas()).isGreaterThanOrEqualTo(1);
+        for (Instant[] rango : new Instant[][]{{null,hasta},{desde,null},{hasta,desde},{desde,desde.plus(91,ChronoUnit.DAYS)}}) {
+            assertThatThrownBy(()->offerService.operatorMetrics(rango[0],rango[1],company,false)).extracting("code").isEqualTo("INVALID_METRICS_RANGE");
+        }
+    }
+
+    @Test
     void listadoDelOperadorFiltraPorEmpresaEstadoYFechas() {
         UUID company=UUID.randomUUID();
         when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId,company,new BigDecimal("95000"),"PROGRAMADO",Instant.now().plus(2,ChronoUnit.DAYS)));
@@ -577,6 +616,7 @@ class OfferDraftIT {
         offerService.onItineraryRescheduled(itineraryId,later);
         Offer updated=offerRepository.findById(scheduled.offerId()).orElseThrow();
         assertThat(updated.getFin()).isCloseTo(scheduled.fin(),within(1,ChronoUnit.MILLIS));
+        assertThat(updated.getAgotadaEn()).isNull();
     }
 
     @Test

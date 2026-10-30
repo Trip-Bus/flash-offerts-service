@@ -541,8 +541,6 @@ public class OfferService {
     @Transactional(readOnly = true)
     public OperatorMetrics operatorMetrics(Instant desde, Instant hasta, UUID company, boolean admin) {
         if(desde==null||hasta==null||!hasta.isAfter(desde)||Duration.between(desde,hasta).toDays()>90) throw ApiException.badRequest("INVALID_METRICS_RANGE","El rango debe ser válido y de máximo 90 días");
-        String scope=admin?"":" and o.company_id=?";
-        java.util.List<Object> args=new java.util.ArrayList<>();args.add(java.sql.Timestamp.from(desde));args.add(java.sql.Timestamp.from(hasta));if(!admin)args.add(company);
         return jdbc.queryForObject("""
           select count(*), coalesce(sum(x.ventas),0), coalesce(sum(x.ingresos),0), coalesce(sum(x.descuento),0),
           coalesce(avg(x.conversion),0), (array_agg(x.id order by x.elapsed nulls last))[1]
@@ -550,8 +548,11 @@ public class OfferService {
           coalesce(sum(case when s.estado='VENDIDA' then o.precio_oferta else 0 end),0) ingresos,
           coalesce(sum(case when s.estado='VENDIDA' then o.precio_base-o.precio_oferta else 0 end),0) descuento,
           case when count(s.id)=0 then 0 else count(s.id) filter(where s.estado='VENDIDA')::numeric/count(s.id) end conversion
-          from offers o left join offer_sales s on s.offer_id=o.id where o.inicio>=? and o.inicio<=?"""+scope+" group by o.id) x",
-          (rs,n)->new OperatorMetrics(rs.getLong(1),rs.getLong(2),rs.getBigDecimal(3),rs.getBigDecimal(4),rs.getBigDecimal(5),rs.getObject(6,UUID.class)),args.toArray());
+          from offers o left join offer_sales s on s.offer_id=o.id
+          where o.inicio>=? and o.inicio<=? and (?::boolean or o.company_id=?) group by o.id) x
+          """,
+          (rs,n)->new OperatorMetrics(rs.getLong(1),rs.getLong(2),rs.getBigDecimal(3),rs.getBigDecimal(4),rs.getBigDecimal(5),rs.getObject(6,UUID.class)),
+          java.sql.Timestamp.from(desde),java.sql.Timestamp.from(hasta),admin,company);
     }
 
     @Transactional(readOnly = true)
