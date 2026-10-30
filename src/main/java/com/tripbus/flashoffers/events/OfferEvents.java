@@ -9,6 +9,7 @@ public final class OfferEvents {
     public static final String OFFER_SOLD_OUT = "OfferSoldOut";
     public static final String OFFER_UPDATED = "OfferUpdated";
     public static final String OFFER_QUOTA_UPDATED = "OfferQuotaUpdated";
+    public static final String OFFER_ALERT = "OfferAlert";
 
     // Consume
     public static final String SEAT_SOLD = "SeatSold";

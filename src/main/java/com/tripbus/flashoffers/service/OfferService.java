@@ -25,6 +25,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -62,15 +63,17 @@ public class OfferService {
     private final SeatInventoryClient seatInventory;
     private final CatalogClient catalog;
     private final EventPublisher events;
+    private final OfferAlertService alerts;
     private final TransactionTemplate tx;
     private final JdbcTemplate jdbc;
     private final Clock clock;
     @Value("${tripbus.offers.min-discount:5}") private BigDecimal minDiscount = BigDecimal.valueOf(5);
     @Value("${tripbus.offers.max-discount:70}") private BigDecimal maxDiscount = BigDecimal.valueOf(70);
 
+    @Autowired
     public OfferService(OfferRepository offerRepository, OfferSaleRepository saleRepository, QuotaCounter quota,
                         SeatInventoryClient seatInventory, CatalogClient catalog, EventPublisher events,
-                        TransactionTemplate tx, JdbcTemplate jdbc, Clock clock) {
+                        TransactionTemplate tx, JdbcTemplate jdbc, Clock clock, OfferAlertService alerts) {
         this.offerRepository = offerRepository;
         this.saleRepository = saleRepository;
         this.quota = quota;
@@ -80,6 +83,13 @@ public class OfferService {
         this.tx = tx;
         this.jdbc = jdbc;
         this.clock = clock;
+        this.alerts = alerts;
+    }
+    /** Conserva compatibilidad para consumidores que construyen el servicio sin el fan-out opcional. */
+    public OfferService(OfferRepository offerRepository, OfferSaleRepository saleRepository, QuotaCounter quota,
+                        SeatInventoryClient seatInventory, CatalogClient catalog, EventPublisher events,
+                        TransactionTemplate tx, JdbcTemplate jdbc, Clock clock) {
+        this(offerRepository,saleRepository,quota,seatInventory,catalog,events,tx,jdbc,clock,null);
     }
 
     // ------------------------------------------------------------------ CreateOffer (US-054)
@@ -251,6 +261,7 @@ public class OfferService {
         payload.put("origen", offer.getOrigen()); payload.put("destino", offer.getDestino());
         payload.put("timestamp", clock.instant());
         events.publishAfterCommit(OfferEvents.OFFER_ACTIVATED, payload);
+        if (alerts != null) alerts.alertAfterCommit(offer);
         events.publishAfterCommit(OfferEvents.OFFER_QUOTA_UPDATED, quotaPayload(offer.getId(), remaining(offer)));
     }
 
@@ -391,7 +402,7 @@ public class OfferService {
     private void markSoldOut(UUID offerId) {
         tx.executeWithoutResult(s -> offerRepository.lockById(offerId).ifPresent(o -> {
             if (o.getEstado() == OfferStatus.ACTIVA) {
-                o.agotar();
+                o.agotar(clock.instant());
                 events.publishAfterCommit(OfferEvents.OFFER_SOLD_OUT,
                         Map.of("offerId", offerId, "itineraryId", o.getItineraryId(), "origen",Objects.toString(o.getOrigen(),""),"destino",Objects.toString(o.getDestino(),""), "timestamp", clock.instant()));
             }
@@ -506,6 +517,43 @@ public class OfferService {
             Instant fechaSalida, BigDecimal precioBase, BigDecimal precioOferta, BigDecimal descuentoPorcentaje,
             int cupoRestante, Instant inicio, Instant fin, long segundosRestantes, String estado) { }
     public record OperatorOffer(OfferResponse oferta, int cupoVendido, int cupoRestante) { }
+    public record OfferMetrics(int cupo, long reservasCreadas, long ventas, long liberadasOVencidas,
+                               BigDecimal conversion, Long tiempoEnAgotarseSegundos, BigDecimal ingresos,
+                               BigDecimal descuentoTotalOtorgado, long seguidoresAlertados) { }
+    public record OperatorMetrics(long ofertas, long ventas, BigDecimal ingresos, BigDecimal descuentoOtorgado,
+                                  BigDecimal conversionPromedio, UUID ofertaAgotadaMasRapido) { }
+
+    /** Agregados en PostgreSQL para no materializar las ventas en la JVM. */
+    @Transactional(readOnly = true)
+    public OfferMetrics metrics(UUID id, UUID company, boolean admin) {
+        Offer offer=offerRepository.findById(id).orElseThrow(()->ApiException.notFound("OFFER_NOT_FOUND","La oferta no existe")); checkCompany(offer,company,admin);
+        return jdbc.queryForObject("""
+          select o.cupo_max, count(s.id), count(s.id) filter(where s.estado='VENDIDA'),
+          count(s.id) filter(where s.estado='LIBERADA'), (select count(*) from offer_alerts_sent aa where aa.offer_id=o.id),
+          case when o.agotada_en is null then null else extract(epoch from (o.agotada_en-o.inicio))::bigint end,
+          coalesce(sum(case when s.estado='VENDIDA' then o.precio_oferta else 0 end),0),
+          coalesce(sum(case when s.estado='VENDIDA' then (o.precio_base-o.precio_oferta) else 0 end),0)
+          from offers o left join offer_sales s on s.offer_id=o.id
+          where o.id=? group by o.id
+          """, (rs,n)-> {long reservations=rs.getLong(2),sales=rs.getLong(3); Long elapsed=rs.getObject(6,Long.class); return new OfferMetrics(rs.getInt(1),reservations,sales,rs.getLong(4),reservations==0?BigDecimal.ZERO:BigDecimal.valueOf(sales).divide(BigDecimal.valueOf(reservations),4,java.math.RoundingMode.HALF_UP),elapsed,rs.getBigDecimal(7),rs.getBigDecimal(8),rs.getLong(5));},id);
+    }
+
+    @Transactional(readOnly = true)
+    public OperatorMetrics operatorMetrics(Instant desde, Instant hasta, UUID company, boolean admin) {
+        if(desde==null||hasta==null||!hasta.isAfter(desde)||Duration.between(desde,hasta).toDays()>90) throw ApiException.badRequest("INVALID_METRICS_RANGE","El rango debe ser válido y de máximo 90 días");
+        return jdbc.queryForObject("""
+          select count(*), coalesce(sum(x.ventas),0), coalesce(sum(x.ingresos),0), coalesce(sum(x.descuento),0),
+          coalesce(avg(x.conversion),0), (array_agg(x.id order by x.elapsed nulls last))[1]
+          from (select o.id,o.agotada_en-o.inicio elapsed, count(s.id) filter(where s.estado='VENDIDA') ventas,
+          coalesce(sum(case when s.estado='VENDIDA' then o.precio_oferta else 0 end),0) ingresos,
+          coalesce(sum(case when s.estado='VENDIDA' then o.precio_base-o.precio_oferta else 0 end),0) descuento,
+          case when count(s.id)=0 then 0 else count(s.id) filter(where s.estado='VENDIDA')::numeric/count(s.id) end conversion
+          from offers o left join offer_sales s on s.offer_id=o.id
+          where o.inicio>=? and o.inicio<=? and (?::boolean or o.company_id=?) group by o.id) x
+          """,
+          (rs,n)->new OperatorMetrics(rs.getLong(1),rs.getLong(2),rs.getBigDecimal(3),rs.getBigDecimal(4),rs.getBigDecimal(5),rs.getObject(6,UUID.class)),
+          java.sql.Timestamp.from(desde),java.sql.Timestamp.from(hasta),admin,company);
+    }
 
     @Transactional(readOnly = true)
     public Page<ShowcaseOffer> showcase(String origin, String destination, int page, int size) {

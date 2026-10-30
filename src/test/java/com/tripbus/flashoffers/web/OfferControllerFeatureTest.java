@@ -10,7 +10,9 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import com.tripbus.flashoffers.service.RouteFollowService;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.*;
 
 class OfferControllerFeatureTest {
@@ -33,5 +35,28 @@ class OfferControllerFeatureTest {
   assertThat(controller.update(id,update,auth)).isSameAs(expected);
   assertThat(controller.cancel(id,auth)).isSameAs(expected);
   assertThat(controller.duplicate(id,duplicate,auth).getStatusCode().value()).isEqualTo(201);
+ }
+ @Test void seguimientosDeRutaUsanElUsuarioAutenticado(){
+  OfferService service=mock(OfferService.class);RouteFollowService follows=mock(RouteFollowService.class);
+  UUID user=UUID.randomUUID(),id=UUID.randomUUID();var auth=operator(user,UUID.randomUUID());
+  var request=new RouteFollowRequest("Bogotá","Cali");var followed=new RouteFollowResponse(id,"Bogotá","Cali",Instant.now());
+  when(follows.follow(user,request)).thenReturn(followed);when(follows.list(user)).thenReturn(List.of(followed));
+  OfferController controller=new OfferController(service,follows);
+  var created=controller.follow(request,auth);
+  assertThat(created.getStatusCode().value()).isEqualTo(201);
+  assertThat(created.getBody()).isSameAs(followed);
+  assertThat(controller.follows(auth)).containsExactly(followed);
+  assertThat(controller.unfollow(id,auth).getStatusCode().value()).isEqualTo(204);
+  verify(follows).delete(user,id);
+ }
+ @Test void sinServicioDeSeguimientosFallaExplicitamente(){
+  var auth=operator(UUID.randomUUID(),UUID.randomUUID());
+  assertThatThrownBy(()->new OfferController(mock(OfferService.class)).follows(auth)).isInstanceOf(IllegalStateException.class);
+ }
+ @Test void metricasDeOfertaUsanLaEmpresaDelOperador(){
+  OfferService service=mock(OfferService.class);UUID id=UUID.randomUUID(),company=UUID.randomUUID();
+  var metrics=new OfferService.OfferMetrics(2,1,1,0,BigDecimal.ONE,null,new BigDecimal("50"),new BigDecimal("50"),3);
+  when(service.metrics(id,company,false)).thenReturn(metrics);
+  assertThat(new OfferController(service).metrics(id,operator(UUID.randomUUID(),company))).isSameAs(metrics);
  }
 }
