@@ -42,10 +42,12 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -447,5 +449,203 @@ class OfferDraftIT {
         var page=offerService.showcase("aguilanorte","calidestino",0,20);
         assertThat(page.getContent()).extracting(OfferService.ShowcaseOffer::offerId).containsExactly(active.offerId(),scheduled.offerId());
         assertThat(offerService.showcase("águilanorte","medellín",0,20).getContent()).isEmpty();
+    }
+
+    @Test
+    void listadoDelOperadorFiltraPorEmpresaEstadoYFechas() {
+        UUID company=UUID.randomUUID();
+        when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId,company,new BigDecimal("95000"),"PROGRAMADO",Instant.now().plus(2,ChronoUnit.DAYS)));
+        OfferResponse scheduled=crearProgramada();
+        Offer pendiente=borrador(Instant.now());
+
+        var page=offerService.operatorOffers("programada",scheduled.inicio().minusSeconds(1),scheduled.inicio().plusSeconds(1),0,10,company,false);
+        assertThat(page.getContent()).hasSize(1);
+        assertThat(page.getContent().get(0).oferta().offerId()).isEqualTo(scheduled.offerId());
+        assertThat(page.getContent().get(0).cupoVendido()).isZero();
+        assertThat(page.getContent().get(0).cupoRestante()).isEqualTo(2);
+        assertThat(offerService.operatorOffers(null,null,null,0,10,company,false).getTotalElements()).isEqualTo(1);
+        assertThat(offerService.operatorOffers("CERRADA",null,null,0,10,company,false).getContent()).isEmpty();
+        assertThat(offerService.operatorOffers(null,scheduled.inicio().plusSeconds(1),null,0,10,company,false).getContent()).isEmpty();
+        assertThat(offerService.operatorOffers(null,null,scheduled.inicio().minusSeconds(1),0,10,company,false).getContent()).isEmpty();
+        assertThat(offerService.operatorOffers(null,null,null,5,10,company,false).getContent()).isEmpty();
+        assertThat(offerService.operatorOffers(null,null,null,0,100,null,true).getContent()).extracting(o->o.oferta().offerId()).contains(scheduled.offerId());
+        offerRepository.deleteById(pendiente.getId());
+    }
+
+    @Test
+    void editarValidaVentanaDescuentoCupoSalidaYCruces() {
+        OfferResponse scheduled=crearProgramada();
+        UUID id=scheduled.offerId();
+        Instant inicio=scheduled.inicio(),fin=scheduled.fin();
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(null,null,null,Instant.now().minusSeconds(60),null,null,null),null,true)).extracting("code").isEqualTo("INVALID_OFFER_WINDOW");
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(null,null,null,null,inicio.plusSeconds(60),null,null),null,true)).extracting("code").isEqualTo("INVALID_OFFER_WINDOW");
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(new BigDecimal("94000"),null,null,null,null,null,null),null,true)).extracting("code").isEqualTo("INVALID_DISCOUNT");
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(new BigDecimal("10000"),null,null,null,null,null,null),null,true)).extracting("code").isEqualTo("INVALID_DISCOUNT");
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(null,5,null,null,null,null,null),null,true)).extracting("code").isEqualTo("QUOTA_EXCEEDS_SEATS");
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(null,2,3,null,null,null,null),null,true)).extracting("code").isEqualTo("QUOTA_EXCEEDS_SEATS");
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(null,null,null,null,Instant.now().plus(3,ChronoUnit.DAYS),null,null),null,true)).extracting("code").isEqualTo("OFFER_ENDS_AFTER_DEPARTURE");
+
+        OfferResponse next=offerService.create(new CreateOfferRequest(itineraryId,List.of("7","8"),new BigDecimal("49900"),2,
+                fin.plus(1,ChronoUnit.HOURS),fin.plus(2,ChronoUnit.HOURS)),UUID.randomUUID(),false,null);
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(null,null,null,null,next.inicio().plusSeconds(60),null,null),null,true)).extracting("code").isEqualTo("OFFER_OVERLAP");
+
+        // Seat Inventory reserva menos asientos que el cupo: se restauran los originales.
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenAnswer(inv ->
+                new SeatInventoryClient.OfferSeats(inv.getArgument(0),inv.getArgument(1),List.of("4"),List.of("5")))
+                .thenAnswer(inv -> new SeatInventoryClient.OfferSeats(inv.getArgument(0),inv.getArgument(1),inv.getArgument(2),List.of()));
+        assertThatThrownBy(()->offerService.update(id,new UpdateOfferRequest(null,null,null,null,null,List.of("4","5"),null),null,true)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+        assertThat(offerService.get(id).asientos()).containsExactly("1","2","3");
+        assertThat(offerService.get(id).inicio()).isCloseTo(inicio,within(1,ChronoUnit.MILLIS));
+    }
+
+    @Test
+    void crearValidaVentanaCupoViajeDescuentoYEmpresa() {
+        reservaConAsientos();
+        Instant start=Instant.now().plus(20,ChronoUnit.MINUTES),end=start.plus(1,ChronoUnit.HOURS);
+        BigDecimal price=new BigDecimal("49900");
+        UUID user=UUID.randomUUID();
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),price,1,end,start),user,false,null)).extracting("code").isEqualTo("INVALID_OFFER_WINDOW");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),price,1,Instant.now().minusSeconds(60),end),user,false,null)).extracting("code").isEqualTo("INVALID_OFFER_WINDOW");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),price,1,start,start.plusSeconds(60)),user,false,null)).extracting("code").isEqualTo("INVALID_OFFER_WINDOW");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"," "),price,2,start,end),user,false,null)).extracting("code").isEqualTo("QUOTA_EXCEEDS_SEATS");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1","2"),price,1,start,end,2),user,false,null)).extracting("code").isEqualTo("MAX_PER_USER_EXCEEDS_QUOTA");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),new BigDecimal("94000"),1,start,end),user,false,null)).extracting("code").isEqualTo("INVALID_DISCOUNT");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),new BigDecimal("10000"),1,start,end),user,false,null)).extracting("code").isEqualTo("INVALID_DISCOUNT");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),price,1,start,end),user,true,UUID.randomUUID())).extracting("code").isEqualTo("NOT_YOUR_COMPANY");
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),price,1,start,start.plus(3,ChronoUnit.DAYS)),user,false,null)).extracting("code").isEqualTo("OFFER_ENDS_AFTER_DEPARTURE");
+        when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId,companyId,new BigDecimal("95000"),"CANCELADO",Instant.now().plus(2,ChronoUnit.DAYS)));
+        assertThatThrownBy(()->offerService.create(new CreateOfferRequest(itineraryId,List.of("1"),price,1,start,end),user,false,null)).extracting("code").isEqualTo("ITINERARY_NOT_AVAILABLE");
+        assertThat(offerService.list(itineraryId)).isEmpty();
+    }
+
+    @Test
+    void cancelarOfertaActivaNoSePermite() {
+        reservaConAsientos();
+        OfferResponse active=crear();
+        assertThatThrownBy(()->offerService.cancelByOperator(active.offerId(),companyId,false)).extracting("code").isEqualTo("OFFER_NOT_CANCELLABLE");
+    }
+
+    private UUID destinoDuplicado(UUID company) {
+        UUID target=UUID.randomUUID();
+        when(catalog.itinerary(target)).thenReturn(new CatalogClient.Itinerary(target,company,new BigDecimal("95000"),"PROGRAMADO",Instant.now().plus(2,ChronoUnit.DAYS)));
+        return target;
+    }
+
+    @Test
+    void duplicarRechazaOtraEmpresaYFaltaDeAsientos() {
+        OfferResponse original=crearProgramada();
+        Instant start=Instant.now().plus(30,ChronoUnit.MINUTES),end=start.plus(1,ChronoUnit.HOURS);
+        UUID user=UUID.randomUUID();
+
+        UUID foreign=destinoDuplicado(UUID.randomUUID());
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),new DuplicateOfferRequest(foreign,start,end,null),null,true,user)).extracting("code").isEqualTo("ITINERARY_NOT_FOUND");
+        UUID own=destinoDuplicado(companyId);
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),new DuplicateOfferRequest(own,start,end,null),UUID.randomUUID(),false,user)).extracting("code").isEqualTo("OFFER_NOT_FOUND");
+
+        // Asientos indicados: si no alcanzan para el cupo, no hay respaldo automático.
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenAnswer(inv ->
+                new SeatInventoryClient.OfferSeats(inv.getArgument(0),inv.getArgument(1),List.of("9"),List.of("10")));
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),new DuplicateOfferRequest(own,start,end,List.of("9","10")),companyId,false,user)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+
+        // Asientos automáticos: ni los originales ni los libres alcanzan.
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),new DuplicateOfferRequest(own,start,end,null),companyId,false,user)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+
+        // Asientos automáticos: la reserva de los originales falla y la de libres también -> error original.
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenThrow(ApiException.unavailable("SEAT_INVENTORY_UNAVAILABLE","caído"));
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),new DuplicateOfferRequest(own,start,end,null),companyId,false,user)).extracting("code").isEqualTo("SEAT_INVENTORY_UNAVAILABLE");
+        assertThat(offerService.list(own)).isEmpty();
+    }
+
+    @Test
+    void duplicarConAsientosAutomaticosSeRecuperaSiFallaLaReservaDeLosOriginales() {
+        OfferResponse original=crearProgramada();
+        UUID own=destinoDuplicado(companyId);
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenAnswer(inv -> {
+            List<String> asked=inv.getArgument(2);
+            if(!asked.isEmpty()) throw ApiException.unavailable("SEAT_INVENTORY_UNAVAILABLE","caído");
+            return new SeatInventoryClient.OfferSeats(inv.getArgument(0),inv.getArgument(1),List.of("B1","B2"),List.of());
+        });
+        Instant start=Instant.now().plus(30,ChronoUnit.MINUTES);
+        OfferResponse copy=offerService.duplicate(original.offerId(),new DuplicateOfferRequest(own,start,start.plus(1,ChronoUnit.HOURS),null),companyId,false,UUID.randomUUID());
+        assertThat(copy.asientos()).containsExactly("B1","B2");
+    }
+
+    @Test
+    void reprogramarElViajeMasTardeNoRecortaElFin() {
+        OfferResponse scheduled=crearProgramada();
+        Instant later=Instant.now().plus(3,ChronoUnit.DAYS);
+        offerService.onItineraryRescheduled(itineraryId,later);
+        Offer updated=offerRepository.findById(scheduled.offerId()).orElseThrow();
+        assertThat(updated.getFin()).isCloseTo(scheduled.fin(),within(1,ChronoUnit.MILLIS));
+    }
+
+    @Test
+    void crearSinReprogramacionYSinFechaDeSalidaConservaLaPreferencia() {
+        reservaConAsientos();
+        when(catalog.itinerary(itineraryId)).thenReturn(new CatalogClient.Itinerary(itineraryId,companyId,new BigDecimal("95000"),"PROGRAMADO",null));
+        Instant start=Instant.now().plus(20,ChronoUnit.MINUTES);
+        OfferResponse offer=offerService.create(new CreateOfferRequest(itineraryId,List.of("1","2"),new BigDecimal("49900"),2,
+                start,start.plus(1,ChronoUnit.HOURS),1,false),UUID.randomUUID(),false,null);
+        assertThat(offer.permiteReprogramar()).isFalse();
+        assertThat(offer.estado()).isEqualTo("PROGRAMADA");
+    }
+
+    @Test
+    void duplicarRechazaRespuestasVaciasDeSeatInventory() {
+        OfferResponse original=crearProgramada();
+        UUID own=destinoDuplicado(companyId);
+        Instant start=Instant.now().plus(30,ChronoUnit.MINUTES),end=start.plus(1,ChronoUnit.HOURS);
+        UUID user=UUID.randomUUID();
+
+        // Asientos automáticos: los originales no responden y los libres llegan sin lista.
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenReturn(null)
+                .thenReturn(new SeatInventoryClient.OfferSeats(UUID.randomUUID(),own,null,List.of()));
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),new DuplicateOfferRequest(own,start,end,null),companyId,false,user)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+
+        // Asientos automáticos: la reserva de libres falla después de una respuesta insuficiente.
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenReturn(new SeatInventoryClient.OfferSeats(UUID.randomUUID(),own,null,List.of()))
+                .thenThrow(ApiException.unavailable("SEAT_INVENTORY_UNAVAILABLE","caído"));
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),new DuplicateOfferRequest(own,start,end,null),companyId,false,user)).extracting("code").isEqualTo("SEAT_INVENTORY_UNAVAILABLE");
+
+        // Asientos indicados: Seat Inventory no responde o responde sin lista.
+        doReturn(null,new SeatInventoryClient.OfferSeats(UUID.randomUUID(),own,null,List.of()))
+                .when(seatInventory).reserveOfferSeats(any(),any(),anyList());
+        DuplicateOfferRequest manual=new DuplicateOfferRequest(own,start,end,List.of("9","10"));
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),manual,companyId,false,user)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),manual,companyId,false,user)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+
+        // Asientos indicados: si la reserva falla no se intenta con asientos libres.
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenThrow(ApiException.unavailable("SEAT_INVENTORY_UNAVAILABLE","caído"));
+        assertThatThrownBy(()->offerService.duplicate(original.offerId(),manual,companyId,false,user)).extracting("code").isEqualTo("SEAT_INVENTORY_UNAVAILABLE");
+        assertThat(offerService.list(own)).isEmpty();
+    }
+
+    @Test
+    void editarFallaSiSeatInventoryNoDevuelveAsientosYRestauraLosOriginales() {
+        OfferResponse scheduled=crearProgramada();
+        UUID id=scheduled.offerId();
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenReturn(null)
+                .thenReturn(new SeatInventoryClient.OfferSeats(id,itineraryId,null,List.of()))
+                .thenAnswer(inv -> new SeatInventoryClient.OfferSeats(inv.getArgument(0),inv.getArgument(1),inv.getArgument(2),List.of()));
+        UpdateOfferRequest seats=new UpdateOfferRequest(null,null,null,null,null,List.of("4","5"),null);
+        assertThatThrownBy(()->offerService.update(id,seats,null,true)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+        // La restauración también falla: se conserva el error original y la oferta no cambia.
+        when(seatInventory.reserveOfferSeats(any(),any(),anyList())).thenReturn(new SeatInventoryClient.OfferSeats(id,itineraryId,null,List.of()))
+                .thenThrow(ApiException.unavailable("SEAT_INVENTORY_UNAVAILABLE","caído"));
+        assertThatThrownBy(()->offerService.update(id,seats,null,true)).extracting("code").isEqualTo("NO_SEATS_AVAILABLE");
+        assertThat(offerService.get(id).asientos()).containsExactly("1","2","3");
+    }
+
+    @Test
+    void editarAsientosDeOfertaConContadorLoReinicia() {
+        OfferResponse scheduled=crearProgramada();
+        UUID id=scheduled.offerId();
+        quotaCounter.initialize(id,2,List.of("1","2","3"));
+        reservaConAsientos();
+        OfferResponse changed=offerService.update(id,new UpdateOfferRequest(null,2,2,null,null,List.of(" 7 ","8",""),true),companyId,false);
+        assertThat(changed.asientos()).containsExactly("7","8");
+        assertThat(quotaCounter.isInitialized(id)).isTrue();
+        assertThat(quotaCounter.remaining(id)).isEqualTo(2);
+        quotaCounter.delete(id);
     }
 }
