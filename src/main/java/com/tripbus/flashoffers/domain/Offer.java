@@ -71,6 +71,19 @@ public class Offer {
     @Column(name = "agotada_en")
     private Instant agotadaEn;
 
+    /** US-162: con sala de espera, reservar exige un token de admisión vigente. */
+    @Column(name = "sala_espera_habilitada", nullable = false)
+    private boolean salaEsperaHabilitada;
+
+    /** US-167/US-169: MANUAL, AUTOMATICA (regla de baja ocupación) o RECURRENTE (plantilla). */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "origen_creacion", nullable = false)
+    private OfferSource origenCreacion = OfferSource.MANUAL;
+
+    /** US-169: plantilla que generó la oferta (idempotencia por plantilla y viaje). */
+    @Column(name = "template_id")
+    private UUID templateId;
+
     @ElementCollection(fetch = FetchType.LAZY)
     @CollectionTable(name = "offer_seats", joinColumns = @JoinColumn(name = "offer_id"))
     @Column(name = "seat_number", nullable = false)
@@ -162,6 +175,29 @@ public class Offer {
         this.inicio=inicio; this.fin=fin; this.permiteReprogramar=reprogramar;
         this.asientos.clear(); this.asientos.addAll(seats);
     }
+    /** Cómo nace la oferta: sala de espera, origen y plantilla (solo al crearla). */
+    public void origen(boolean salaEspera, OfferSource origen, UUID plantilla) {
+        this.salaEsperaHabilitada = salaEspera;
+        this.origenCreacion = origen != null ? origen : OfferSource.MANUAL;
+        this.templateId = plantilla;
+    }
+
+    public void habilitarSalaEspera(boolean habilitada) {
+        this.salaEsperaHabilitada = habilitada;
+    }
+
+    public boolean isSalaEsperaHabilitada() {
+        return salaEsperaHabilitada;
+    }
+
+    public OfferSource getOrigenCreacion() {
+        return origenCreacion;
+    }
+
+    public UUID getTemplateId() {
+        return templateId;
+    }
+
     public void reprogramarViaje(Instant salida) { this.fechaSalida=salida; if (fin.isAfter(salida)) this.fin=salida; }
     public UUID getCompanyId(){return companyId;} public String getOrigen(){return origen;} public String getDestino(){return destino;}
     public Instant getFechaSalida(){return fechaSalida;} public BigDecimal getPrecioBase(){return precioBase;}

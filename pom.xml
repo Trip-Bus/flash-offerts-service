@@ -28,7 +28,6 @@
         <postgresql.version>42.7.12</postgresql.version>
 
         <springdoc.version>2.8.17</springdoc.version>
-        <logstash-logback.version>8.0</logstash-logback.version>
         <jacoco.version>0.8.12</jacoco.version>
         <sonar-maven-plugin.version>5.8.0.7211</sonar-maven-plugin.version>
 
@@ -44,9 +43,13 @@
              2026-10-12 (pruebas de borrador, compensación y limpieza): líneas 65,4 % -> 0.60 y ramas 52,2 % -> 0.50
              (0.65 de líneas dejaría menos de medio punto de margen; misma razón que arriba).
              2026-10-12 (límite por usuario y reconciliación del cupo, US-058): líneas 68,8 % -> 0.65 y
-             ramas 59,8 % -> 0.55. -->
-        <jacoco.minimo.lineas>0.65</jacoco.minimo.lineas>
-        <jacoco.minimo.ramas>0.55</jacoco.minimo.ramas>
+             ramas 59,8 % -> 0.55.
+             2026-11-05 (sprints 5 y 6: observabilidad, sala de espera, antiabuso, automáticas y recurrentes):
+             líneas 89,5 % -> 0.85 y ramas 84,0 % -> 0.80. Además el código nuevo de los sprints 5 y 6 exige
+             0.80 de líneas POR CLASE (segunda regla, CLASS, de jacoco:check). -->
+        <jacoco.minimo.lineas>0.85</jacoco.minimo.lineas>
+        <jacoco.minimo.ramas>0.80</jacoco.minimo.ramas>
+        <jacoco.minimo.clase.nueva>0.80</jacoco.minimo.clase.nueva>
 
         <!-- SonarQube Cloud: el análisis lo lanza el CI solo en develop (push y PR con base develop)
              cuando existe el secreto SONAR_TOKEN. El plan Free analiza una única rama. -->
@@ -139,11 +142,19 @@
             <version>${springdoc.version}</version>
         </dependency>
 
-        <!-- Logs en JSON en PROD (logback-spring.xml). -->
+        <!-- HT-10: trazas distribuidas (Micrometer Tracing sobre OpenTelemetry) exportadas por OTLP.
+             Versiones gestionadas por Spring Boot. Sin OTEL_EXPORTER_OTLP_ENDPOINT no se exporta nada
+             (ObservabilityEnvironment), pero traceId/spanId siguen en los logs y se propagan.
+             Los logs JSON (LOG_FORMAT=json) usan el formato ECS nativo de Spring Boot: ya no hace falta
+             logstash-logback-encoder. -->
         <dependency>
-            <groupId>net.logstash.logback</groupId>
-            <artifactId>logstash-logback-encoder</artifactId>
-            <version>${logstash-logback.version}</version>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
         </dependency>
 
         <dependency>
@@ -282,6 +293,38 @@
                                             <counter>BRANCH</counter>
                                             <value>COVEREDRATIO</value>
                                             <minimum>${jacoco.minimo.ramas}</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                                <!-- Sprints 5 y 6: cada clase nueva con al menos 80 % de líneas cubiertas. -->
+                                <rule>
+                                    <element>CLASS</element>
+                                    <includes>
+                                        <include>com.tripbus.flashoffers.config.ObservabilityEnvironment</include>
+                                        <include>com.tripbus.flashoffers.config.WaitingRoomProperties</include>
+                                        <include>com.tripbus.flashoffers.common.events.EventTracing</include>
+                                        <include>com.tripbus.flashoffers.common.error.TooManyRequestsException</include>
+                                        <include>com.tripbus.flashoffers.common.security.OperatorScope</include>
+                                        <include>com.tripbus.flashoffers.domain.AutoOfferRule</include>
+                                        <include>com.tripbus.flashoffers.domain.OfferTemplate*</include>
+                                        <include>com.tripbus.flashoffers.domain.OfferSource</include>
+                                        <include>com.tripbus.flashoffers.service.OfferMeters*</include>
+                                        <include>com.tripbus.flashoffers.service.WaitingRoom*</include>
+                                        <include>com.tripbus.flashoffers.service.ReservationRateLimiter</include>
+                                        <include>com.tripbus.flashoffers.service.GeneratedOffers</include>
+                                        <include>com.tripbus.flashoffers.service.AutoOffer*</include>
+                                        <include>com.tripbus.flashoffers.service.OfferTemplate*</include>
+                                        <include>com.tripbus.flashoffers.web.OfferQueueController</include>
+                                        <include>com.tripbus.flashoffers.web.AutoOfferRuleController</include>
+                                        <include>com.tripbus.flashoffers.web.OfferTemplateController</include>
+                                        <include>com.tripbus.flashoffers.web.dto.AutoOfferRule*</include>
+                                        <include>com.tripbus.flashoffers.web.dto.OfferTemplate*</include>
+                                    </includes>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>${jacoco.minimo.clase.nueva}</minimum>
                                         </limit>
                                     </limits>
                                 </rule>

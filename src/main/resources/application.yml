@@ -62,6 +62,18 @@ management:
   info:
     env:
       enabled: true
+  # HT-10: trazas con Micrometer Tracing + OpenTelemetry, muestreo del 10 % por defecto. La exportación OTLP
+  # (HTTP, p. ej. http://otel-collector:4318/v1/traces) solo se enciende si OTEL_EXPORTER_OTLP_ENDPOINT trae
+  # valor (ObservabilityEnvironment); sin ella traceId/spanId igual se generan, se propagan y salen en los logs.
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING:0.1}
+
+# Logs: cada línea lleva [traceId,spanId,requestId]. Con LOG_FORMAT=json salen en JSON ECS
+# (logging.structured.format.console=ecs, lo pone ObservabilityEnvironment) con esos mismos campos del MDC.
+logging:
+  pattern:
+    correlation: "[%X{traceId:-},%X{spanId:-},%X{requestId:-}] "
 
 # /actuator/info: commit con el que se construyó la imagen (build-arg GIT_COMMIT del Dockerfile).
 info:
@@ -69,6 +81,11 @@ info:
     commit: ${APP_COMMIT:local}
 
 tripbus:
+  logging:
+    format: ${LOG_FORMAT:plain}
+  openapi:
+    # URL del servidor en el documento OpenAPI (p. ej. la pública del API Gateway). Vacía = la del propio servicio.
+    server-url: ${OPENAPI_SERVER_URL:}
   internal-token: ${INTERNAL_API_TOKEN:tripbus_internal_qa_token}
   events:
     enabled: ${EVENTS_ENABLED:true}
@@ -81,7 +98,24 @@ tripbus:
     catalog-url: ${CATALOG_URL:http://localhost:18002}
     min-discount: ${OFFERS_MIN_DISCOUNT:5}
     max-discount: ${OFFERS_MAX_DISCOUNT:70}
+    # US-168: antiabuso. Reservas de oferta por documento al día (en la zona de la plataforma, en todas las
+    # ofertas) e intentos de reserva por usuario y minuto.
+    max-per-document-per-day: ${OFFERS_MAX_PER_DOCUMENT_PER_DAY:2}
+    reservation-attempts-per-minute: ${OFFERS_RESERVATION_ATTEMPTS_PER_MINUTE:10}
+    zone: America/Bogota
+    # US-162: sala de espera virtual (lotes de admisión y vigencia del token de admisión).
+    queue:
+      batch-interval: ${OFFERS_QUEUE_BATCH_INTERVAL:10s}
+      batch-size: ${OFFERS_QUEUE_BATCH_SIZE:50}
+      admission-ttl: 5m
+      opens-before: 10m
   jobs:
     offer-scheduler-ms: 2000
     # US-058: reconciliación del contador de cupo de Redis con las ventas de la BD (QuotaReconciler).
     quota-reconcile-ms: ${QUOTA_RECONCILE_MS:60000}
+    # Gauge tripbus_ofertas_cupo_restante (cupo restante de cada oferta activa).
+    quota-gauge-ms: 15000
+    # US-167: ofertas automáticas por baja ocupación, cada 15 min en un solo nodo.
+    auto-offers-ms: ${AUTO_OFFERS_MS:900000}
+    # US-169: ofertas recurrentes, una vez al día (zona de la plataforma).
+    offer-templates-cron: "${OFFER_TEMPLATES_CRON:0 0 3 * * *}"

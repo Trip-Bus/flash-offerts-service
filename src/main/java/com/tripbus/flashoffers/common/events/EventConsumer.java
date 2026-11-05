@@ -43,6 +43,7 @@ public class EventConsumer implements SmartLifecycle {
     private final EventProperties properties;
     private final TransactionTemplate transactionTemplate;
     private final ProcessedEventRepository processedEvents;
+    private final EventTracing tracing;
     private final Map<String, DomainEventHandler> handlersByType = new HashMap<>();
     private final String consumerName = "c-" + UUID.randomUUID().toString().substring(0, 8);
 
@@ -56,7 +57,9 @@ public class EventConsumer implements SmartLifecycle {
             EventProperties properties,
             TransactionTemplate transactionTemplate,
             ProcessedEventRepository processedEvents,
-            List<DomainEventHandler> handlers) {
+            List<DomainEventHandler> handlers,
+            EventTracing tracing) {
+        this.tracing = tracing;
         this.connectionFactory = connectionFactory;
         this.redis = redis;
         this.objectMapper = objectMapper;
@@ -120,33 +123,38 @@ public class EventConsumer implements SmartLifecycle {
         }
     }
 
-    private void onMessage(MapRecord<String, String, String> record) {
+    void onMessage(MapRecord<String, String, String> record) {
         Map<String, String> fields = record.getValue();
         String type = fields.get("type");
         DomainEventHandler handler = handlersByType.get(type);
         if (handler != null) {
             EventEnvelope envelope = toEnvelope(fields);
-            for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-                try {
-                    transactionTemplate.executeWithoutResult(status -> {
-                        if (processedEvents.existsById(envelope.eventId())) {
-                            return;
-                        }
-                        handler.handle(envelope);
-                        processedEvents.save(new ProcessedEvent(envelope.eventId(), type));
-                    });
-                    break;
-                } catch (Exception e) {
-                    if (attempt == MAX_ATTEMPTS) {
-                        log.error("Evento {} ({}) descartado tras {} intentos: {}",
-                                envelope.eventId(), type, MAX_ATTEMPTS, e.getMessage(), e);
-                    } else {
-                        sleepQuietly(200L * attempt);
+            // HT-10: el manejo corre en un span hijo del contexto de traza que trae el evento (traceparent).
+            tracing.consume(type, fields, () -> handleWithRetries(handler, envelope));
+        }
+        redis.opsForStream().acknowledge(properties.stream(), properties.group(), record.getId());
+    }
+
+    private void handleWithRetries(DomainEventHandler handler, EventEnvelope envelope) {
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                transactionTemplate.executeWithoutResult(status -> {
+                    if (processedEvents.existsById(envelope.eventId())) {
+                        return;
                     }
+                    handler.handle(envelope);
+                    processedEvents.save(new ProcessedEvent(envelope.eventId(), envelope.type()));
+                });
+                return;
+            } catch (Exception e) {
+                if (attempt == MAX_ATTEMPTS) {
+                    log.error("Evento {} ({}) descartado tras {} intentos: {}",
+                            envelope.eventId(), envelope.type(), MAX_ATTEMPTS, e.getMessage(), e);
+                } else {
+                    sleepQuietly(200L * attempt);
                 }
             }
         }
-        redis.opsForStream().acknowledge(properties.stream(), properties.group(), record.getId());
     }
 
     private EventEnvelope toEnvelope(Map<String, String> fields) {

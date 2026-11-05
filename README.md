@@ -1,5 +1,12 @@
 # Flash Offers Service
 
+## Sprints 5 y 6: observabilidad, sala de espera, antiabuso, automáticas y recurrentes
+
+- HT-10: trazas OpenTelemetry (OTLP opcional), logs JSON ECS con `traceId`/`spanId`/`requestId` y métricas de
+  reservas, activaciones y cupo restante. Ver [Observabilidad](#observabilidad).
+- US-162 sala de espera virtual, US-168 antiabuso, US-167 ofertas automáticas por baja ocupación y US-169 ofertas
+  recurrentes. Ver la [API](#api) y las secciones de reglas que siguen.
+
 ## Sprint 4: alertas y métricas
 
 - `POST /offers/follows`, `GET /offers/follows` y `DELETE /offers/follows/{id}` permiten al pasajero seguir hasta diez rutas; la coincidencia ignora mayúsculas y tildes.
@@ -12,7 +19,7 @@ Ofertas relámpago: creación con cupo y horario, contador atómico de cupo, ven
 
 **Stack:** Java 21 · Spring Boot 3.5.16 · PostgreSQL 16 · Redis 7
 
-**HU:** US-054, US-056, US-058 · **Puerto:** 18006 · **BD:** `tripbus_offers` (puerto QA 18106)
+**HU:** US-054, US-056, US-058, US-160, US-161, US-162, US-164, US-165, US-166, US-167, US-168, US-169, US-192 · HT-10 · **Puerto:** 18006 · **BD:** `tripbus_offers` (puerto QA 18106)
 
 > **Nombre "offerts" / "offers":** el repositorio GitHub, el proyecto de Sonar
 > (`Trip-Bus_flash-offerts-service`) y la imagen (`ghcr.io/trip-bus/flash-offerts-service`) se
@@ -24,14 +31,20 @@ Ofertas relámpago: creación con cupo y horario, contador atómico de cupo, ven
 
 | Método | Endpoint | Doc |
 |---|---|---|
-| POST | `/offers` `{itineraryId, seatNumbers, precioOferta, cupo, inicio, fin}` | CreateOffer (OPERADOR de la empresa del viaje o ADMIN) |
+| POST | `/offers` `{itineraryId, seatNumbers, precioOferta, cupo, inicio, fin, maxPorUsuario?, permiteReprogramar?, salaEsperaHabilitada?}` | CreateOffer (OPERADOR de la empresa del viaje o ADMIN) |
+| POST | `/offers/{id}/queue` | US-162: entra a la sala de espera (PASAJERO; desde 10 min antes del inicio; 201 al entrar, 200 si ya estaba) |
+| GET | `/offers/{id}/queue/me` | US-162: estado y posición en la sala (autenticado) |
+| GET · POST | `/operator/auto-offer-rules` | US-167: lista / crea reglas de ofertas automáticas (OPERADOR de la empresa o ADMIN) |
+| GET · PUT · DELETE | `/operator/auto-offer-rules/{id}` | US-167: consulta / edita / borra una regla |
+| GET · POST | `/operator/offer-templates` | US-169: lista / crea plantillas de ofertas recurrentes (OPERADOR de la empresa o ADMIN) |
+| GET · PUT · DELETE | `/operator/offer-templates/{id}` | US-169: consulta / edita / borra una plantilla |
 | GET | `/offers?itineraryId=` · `/offers/{id}` | GetOfferStatus (público) |
 | GET | `/offers/{id}/quota` | GetRemainingQuota + segundos restantes (público) |
 | POST | `/offers/{id}/reservations` `{docId}` | ReserveOfferSeat → retención del asiento (luego se compra con `POST /bookings`) |
 | POST | `/offers/{id}/activate` · `/offers/{id}/close` | ActivateOffer / CloseOffer (OPERADOR o ADMIN) |
 | GET | `/offers/showcase?origin=&destination=&page=&size=` | Vitrina pública en las próximas 48 h |
 | GET | `/operator/offers?estado=&desde=&hasta=&page=&size=` | Gestión paginada por empresa (OPERADOR) o global (ADMIN) |
-| PUT | `/offers/{id}` | Edita oferta PROGRAMADA antes del inicio; admite precio, cupo, límite, ventana, asientos y `permiteReprogramar` |
+| PUT | `/offers/{id}` | Edita oferta PROGRAMADA antes del inicio; admite precio, cupo, límite, ventana, asientos, `permiteReprogramar` y `salaEsperaHabilitada` |
 | DELETE | `/offers/{id}` | Cancela una oferta PROGRAMADA y libera sus asientos |
 | POST | `/offers/{id}/duplicate` `{itineraryId,inicio,fin,seatNumbers?}` | Duplica descuento y cupos en otro viaje de la misma empresa |
 | GET | `/internal/offers/{id}` | Precio base/oferta y regla de reprogramación (X-Internal-Token) |
@@ -52,12 +65,73 @@ rechaza (409 `OUT_OF_STOCK`), si no toma un asiento de la lista de la oferta. Id
 automáticos por horario (un solo nodo).
 
 **Publica:** `OfferCreated`, `OfferActivated`, `OfferClosed`, `OfferSoldOut`, `OfferUpdated`,
-`OfferQuotaUpdated`. Los eventos de activación, cierre, agotamiento y actualización incluyen `origen`
-y `destino` para la vitrina en tiempo real.
+`OfferQuotaUpdated`, `OfferAlert`, `OfferQueueAdmitted` y `OfferQueueUpdated`. Los eventos de activación,
+cierre, agotamiento y actualización incluyen `origen` y `destino` para la vitrina en tiempo real.
 **Consume:** `SeatSold`, `SeatReleased`, `HoldExpired`, `ItineraryCancelled`, `ItineraryRescheduled`.
+Cada registro del stream lleva además `traceparent` (contexto de traza W3C, ver [Observabilidad](#observabilidad)).
 
 Prueba US-058: `FlashOfferQuotaIT` — 1.000 solicitudes concurrentes, cupo 20 → exactamente 20 ventas
 y el contador nunca baja de 0. Es un **gate**: corre en cada CI.
+
+### Sala de espera virtual (US-162)
+
+- `salaEsperaHabilitada` (falso por defecto) se elige al crear y al editar; duplicar la conserva.
+- Desde `tripbus.offers.queue.opens-before` (10 min) antes del inicio, `POST /offers/{id}/queue` (PASAJERO) entra a
+  la sala, **una vez por usuario**. Antes de esa hora: 409 `QUEUE_NOT_OPEN` (con `abreEn`); sin sala: 409
+  `QUEUE_NOT_ENABLED`; sala cerrada: 409 `QUEUE_CLOSED`.
+- Todo vive en Redis (llaves `offer:{id}:queue*`, sorted set). Antes del inicio la posición no se muestra
+  (`EN_SALA`): **al iniciar la oferta, el primer lote sortea al azar el orden de todos los que ya estaban** (Fisher-Yates
+  atómico en Lua con semilla de `SecureRandom`); quien entra después va al final, por orden de llegada.
+- Cada `tripbus.offers.queue.batch-interval` (10 s), en un solo nodo, se admite un lote de
+  `tripbus.offers.queue.batch-size` (50). Cada admitido recibe un token de admisión de 5 min en Redis
+  (`offer:{id}:admission:{userId}`).
+- Con la sala habilitada, `POST /offers/{id}/reservations` exige un token vigente: sin él (o vencido) 403
+  `QUEUE_TURN_REQUIRED`. La sala se cierra cuando la oferta se agota o termina; si una oferta agotada se reabre
+  (vuelve un cupo), solo reservan quienes aún tienen token.
+- `GET /offers/{id}/queue/me` → `{offerId, estado, posicion, enFila, admisionExpiraEn}` con `estado` en
+  `NO_INSCRITO`, `EN_SALA`, `EN_FILA`, `ADMITIDO`, `TURNO_VENCIDO` o `CERRADA`.
+- Eventos: `OfferQueueAdmitted {userId, offerId, expiraEn}` por cada admitido y, en cada lote (y al cerrar),
+  `OfferQueueUpdated {offerId, enFila, admitidos}` (`admitidos` acumulado). Los difunde el Realtime Gateway.
+
+### Antiabuso (US-168)
+
+- Máximo `tripbus.offers.max-per-document-per-day` (2) reservas de oferta vivas (RESERVADA o VENDIDA) por
+  **documento** al día (zona `tripbus.offers.zone`, America/Bogota), sumando todas las ofertas: 409
+  `DOCUMENT_DAILY_LIMIT` (con `maxPorDocumentoAlDia`). Un lock asesor por documento evita que dos reservas
+  simultáneas pasen el límite; el rechazo no gasta cupo.
+- Máximo `tripbus.offers.reservation-attempts-per-minute` (10) intentos por usuario y minuto en
+  `POST /offers/{id}/reservations`, con contador en Redis (`ratelimit:offer-reservations:{userId}:{minuto}`): 429
+  `TOO_MANY_ATTEMPTS` con cabecera `Retry-After` (segundos hasta el siguiente minuto). Si Redis no responde no se
+  bloquea la reserva.
+
+### Ofertas automáticas por baja ocupación (US-167)
+
+Tabla `auto_offer_rules` (`companyId`, `routeId` opcional, `horasAntes` 1-168, `ocupacionMaxima` %, `descuento` %,
+`cupoMaximo`, `activa`). Cada `tripbus.jobs.auto-offers-ms` (15 min), en un solo nodo, para cada regla activa:
+
+1. Catalog `GET /internal/itineraries?companyId=&routeId=&desde=&hasta=` (con `X-Internal-Token`) da los viajes que
+   salen dentro de `horasAntes` → `[{itineraryId, companyId, routeId, precioBase, estado, fechaSalida}]`.
+2. Seat Inventory `GET /internal/occupancy?itineraryId=` → `{itineraryId, capacidad, ocupados, asientosLibres}`.
+3. Si la ocupación está por debajo de `ocupacionMaxima` y el viaje no tiene oferta (no cerrada) ni una automática
+   previa, crea la oferta con el mismo flujo y las validaciones de crear: precio = base − descuento, asientos libres
+   hasta `cupoMaximo`, de ahora + 1 min hasta 30 min antes de la salida, origen `AUTOMATICA`.
+
+**Una sola oferta automática por viaje** (también con un índice único, aunque dos nodos coincidan). El descuento de la
+regla debe estar en el rango permitido para ofertas (400 `INVALID_DISCOUNT`).
+
+### Ofertas recurrentes (US-169)
+
+Tabla `offer_templates` (`companyId`, `routeId`, `diasSemana` ISO 1 = lunes … 7 = domingo, `horaInicio` "HH:mm",
+`duracionMinutos`, `descuento`, `cupo`, `maxPorUsuario`, `permiteReprogramar`, `salaEspera`, `horasAntesSalida`,
+`activa`). Un job diario (`tripbus.jobs.offer-templates-cron`, 03:00 hora de la plataforma, un solo nodo) crea con
+cada plantilla activa las ofertas de los **próximos 7 días** para los viajes de su ruta que salen en esos días: la
+oferta empieza a la `horaInicio` del día que queda `horasAntesSalida` horas antes de la salida y dura
+`duracionMinutos` (si ya pasó o termina después de la salida no se crea). Mismo flujo y validaciones de crear;
+origen `RECURRENTE`. **Idempotente**: no duplica la oferta de una misma plantilla y viaje (índice único
+`template_id, itinerary_id`).
+
+Reglas y plantillas: el OPERADOR solo ve y gestiona las de su empresa (lo ajeno responde 404); el ADMIN ve todas y al
+crear indica `companyId` (400 `COMPANY_REQUIRED` si falta).
 
 ## Flujo de ramas y entornos
 
@@ -166,6 +240,12 @@ Opcionales con valor por defecto: `SERVER_PORT` (18006), `DB_HOST` (localhost), 
 `DB_NAME` (tripbus_offers), `DB_USERNAME` (offers), `DB_POOL_SIZE`, `REDIS_HOST` (localhost),
 `REDIS_PORT` (18100). `DB_HOST` reemplaza a la antigua `DB_URL`.
 
+Observabilidad y reglas (opcionales): `OTEL_EXPORTER_OTLP_ENDPOINT` (vacía = sin exportar trazas),
+`TRACING_SAMPLING` (0.1), `LOG_FORMAT` (`json` = logs ECS; en `prod` es `json` por defecto), `OPENAPI_SERVER_URL`
+(vacía), `OFFERS_MAX_PER_DOCUMENT_PER_DAY` (2), `OFFERS_RESERVATION_ATTEMPTS_PER_MINUTE` (10),
+`OFFERS_QUEUE_BATCH_INTERVAL` (10s), `OFFERS_QUEUE_BATCH_SIZE` (50), `AUTO_OFFERS_MS` (900000) y
+`OFFER_TEMPLATES_CRON` (`0 0 3 * * *`).
+
 ## Swagger
 
 Solo en IDE y QA (en `prod` springdoc está apagado y responde 404):
@@ -174,7 +254,8 @@ Solo en IDE y QA (en `prod` springdoc está apagado y responde 404):
 - OpenAPI JSON: http://localhost:18006/v3/api-docs
 
 Consultar ofertas es público. Para crear/activar/cerrar (OPERADOR o ADMIN) y reservar, haz login en
-identity (`/auth/login`) y pega el `accessToken` en **Authorize**.
+identity (`/auth/login`) y pega el `accessToken` en **Authorize**. Con `OPENAPI_SERVER_URL` (p. ej. la URL
+pública del API Gateway) el documento declara ese servidor; vacía, usa la del propio servicio.
 
 ## Observabilidad
 
@@ -182,8 +263,20 @@ identity (`/auth/login`) y pega el `accessToken` en **Authorize**.
 - `/actuator/info`: versión y fecha del build, y `app.commit` (el commit con el que se construyó la imagen).
 - Cada petición lleva un `requestId`: se reutiliza el header `X-Request-Id` (lo manda el API Gateway)
   o se genera uno, y se devuelve en la respuesta. Flash Offers lo **propaga** en sus llamadas
-  salientes a catalog y seat-inventory, así una petición se sigue entre servicios. Logs legibles con
-  `[requestId]` en IDE/QA y JSON (con `requestId` y `"service":"flash-offers-service"`) en PROD.
+  salientes a catalog y seat-inventory, así una petición se sigue entre servicios.
+- **Trazas (HT-10):** Micrometer Tracing con OpenTelemetry (`micrometer-tracing-bridge-otel`,
+  `opentelemetry-exporter-otlp`, versiones de Spring Boot). Se exportan por OTLP/HTTP a
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (p. ej. `http://otel-collector:4318/v1/traces`); vacía = no se exporta, pero las
+  trazas igual se generan y se propagan. Muestreo `TRACING_SAMPLING` (0.1). El contexto (`traceparent` W3C) viaja en
+  las llamadas a catalog y seat-inventory (`RestClient.Builder` de Spring Boot, con observación) y en cada registro de
+  Redis Streams: al consumir un evento el manejador corre en un span hijo de la traza que lo publicó.
+- **Logs:** cada línea lleva `[traceId,spanId,requestId]`. Con `LOG_FORMAT=json`
+  (`logging.structured.format.console=ecs`) salen en JSON ECS con `traceId`, `spanId` y `requestId` (MDC); en `prod`
+  es el formato por defecto.
+- **Métricas** (Prometheus): `tripbus_reservas_oferta_total{resultado=ok|agotada|limite_usuario|sin_turno}`
+  (`limite_usuario` incluye el límite por persona en la oferta y el diario por documento; `sin_turno`, las reservas
+  sin token de la sala de espera), `tripbus_ofertas_activadas_total{origen=MANUAL|AUTOMATICA|RECURRENTE}` y el gauge
+  `tripbus_ofertas_cupo_restante{offerId}` con el cupo restante de cada oferta activa (se refresca cada 15 s).
 
 ## Pruebas
 
@@ -196,6 +289,11 @@ mvn -B verify      # unitarias + integración con PostgreSQL y Redis reales (Tes
   Flyway reales y el script Lua real del cupo (catalog y seat-inventory se simulan). Verifica US-058
   (1.000 reservas concurrentes con cupo 20 → exactamente 20 ventas, 980 rechazos y el contador nunca
   < 0), la idempotencia por documento, la devolución del cupo y las reglas de creación.
+- Sprints 5 y 6 (comparten un PostgreSQL y un Redis de Testcontainers, `ContainersIT`): `ObservabilityIT`
+  (`traceparent` en el RestClient y en el stream, métricas en `/actuator/prometheus`), `WaitingRoomIT` (entrar antes de
+  tiempo, una vez por usuario, sorteo y orden, lotes y eventos, reserva sin token, token vencido, cierre al agotarse y
+  al terminar), `AntiAbuseIT` (límite por documento y por intentos), `AutoOfferIT` (regla que crea y que no duplica) y
+  `OfferTemplateIT` (plantilla idempotente). Catalog y seat-inventory se simulan.
 
 Toda la plataforma: ver el README de **API-gateway**.
 
@@ -213,17 +311,17 @@ Toda la plataforma: ver el README de **API-gateway**.
 `mvn verify` falla si la cobertura total baja de los mínimos del `pom.xml`, en **todas** las ramas
 (también en `main`, donde Sonar no corre):
 
-| Métrica | Medido (2026-10-09) | Mínimo |
+| Métrica | Medido (2026-11-05, sprints 5 y 6) | Mínimo |
 |---|---|---|
-| Líneas | 54-57 % (CI 54 %, local 55,4-56,8 %: varía según lo que alcance a ejecutar `OfferScheduler` en segundo plano) | `jacoco.minimo.lineas` = 0.50 |
-| Ramas | 43,5 % | `jacoco.minimo.ramas` = 0.40 |
+| Líneas | 89,5 % | `jacoco.minimo.lineas` = 0.85 |
+| Ramas | 84,0 % | `jacoco.minimo.ramas` = 0.80 |
+| Líneas por clase nueva (sprints 5 y 6) | ≥ 80 % en todas | `jacoco.minimo.clase.nueva` = 0.80 |
 
 **La cobertura nunca puede bajar: si agregas pruebas, sube el mínimo.** Corre `mvn verify`, mira
 el total en `target/site/jacoco/index.html` (o la tabla del CI), redondéalo hacia abajo al 5 % y
-actualiza la propiedad en el pom en el mismo PR. **Ambos mínimos están por debajo del 60 % de
-referencia**: hoy solo hay pruebas de configuración y la IT del cupo. Las mejores candidatas para
-subirlos son `OfferController`, `SeatInventoryClient`, `CatalogClient`, `EventConsumer`,
-`OfferEventsHandler`, `CurrentUser` y `GlobalExceptionHandler`.
+actualiza la propiedad en el pom en el mismo PR. La segunda regla de `jacoco:check` (CLASS) exige 80 % de
+líneas a cada clase nueva de los sprints 5 y 6; agrega ahí las clases nuevas de los próximos sprints. Las que aún
+tienen menos cobertura son `GlobalExceptionHandler` y `EventConsumer` (arranque del consumidor).
 
 Fuera de la cobertura (mismas en `sonar.coverage.exclusions` y en los `<excludes>` de JaCoCo) solo
 está lo que no tiene lógica: `FlashOffersApplication`, los records de `web/dto` (`CreateOfferRequest`,

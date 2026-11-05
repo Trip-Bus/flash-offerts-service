@@ -26,11 +26,13 @@ public class SeatInventoryClient {
 
     private final RestClient restClient;
 
-    public SeatInventoryClient(OffersProperties properties, @Value("${tripbus.internal-token}") String token) {
+    /** El builder es el de Spring Boot (observación HTTP): propaga el contexto de traza en cada llamada. */
+    public SeatInventoryClient(OffersProperties properties, RestClient.Builder builder,
+                               @Value("${tripbus.internal-token}") String token) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(1000);
         factory.setReadTimeout(5000);
-        this.restClient = RestClient.builder()
+        this.restClient = builder
                 .baseUrl(properties.seatInventoryUrl())
                 .requestFactory(factory)
                 .defaultHeader("X-Internal-Token", token)
@@ -43,6 +45,27 @@ public class SeatInventoryClient {
 
     public record Hold(UUID holdId, UUID itineraryId, List<String> seatNumbers, UUID userId, UUID offerId,
                        String estado, Instant expiraEn) {
+    }
+
+    /** Ocupación de un viaje ({@code GET /internal/occupancy}): capacidad, ocupados y asientos libres. */
+    public record Occupancy(UUID itineraryId, int capacidad, int ocupados, List<String> asientosLibres) {
+        /** Porcentaje ocupado (0-100). Un viaje sin capacidad conocida se considera lleno. */
+        public double porcentaje() {
+            return capacidad <= 0 ? 100.0 : ocupados * 100.0 / capacidad;
+        }
+
+        public List<String> libres() {
+            return asientosLibres != null ? asientosLibres : List.of();
+        }
+    }
+
+    public Occupancy occupancy(UUID itineraryId) {
+        try {
+            return restClient.get().uri(b -> b.path("/internal/occupancy").queryParam("itineraryId", itineraryId).build())
+                    .retrieve().body(Occupancy.class);
+        } catch (RestClientException e) {
+            throw translate(e);
+        }
     }
 
     public OfferSeats reserveOfferSeats(UUID offerId, UUID itineraryId, List<String> seats) {

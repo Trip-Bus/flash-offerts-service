@@ -29,6 +29,8 @@ public class SecurityConfig {
                 .authorizeHttpRequests(a -> a
                         .requestMatchers("/actuator/health/**", "/actuator/info", "/actuator/prometheus").permitAll()
                         .requestMatchers("/internal/**").hasRole(InternalTokenFilter.INTERNAL_ROLE)
+                        // US-162: el estado en la sala de espera es del pasajero autenticado.
+                        .requestMatchers(HttpMethod.GET, "/offers/*/queue/me").authenticated()
                         // Ver ofertas, su cupo y tiempo restante no requiere cuenta.
                         .requestMatchers(HttpMethod.GET, "/offers", "/offers/**").permitAll()
                         // Swagger (en prod springdoc está apagado y estas rutas dan 404) y página de error.
