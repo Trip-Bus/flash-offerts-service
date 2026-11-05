@@ -2,6 +2,7 @@ package com.tripbus.flashoffers.web;
 
 import com.tripbus.flashoffers.common.security.CurrentUser;
 import com.tripbus.flashoffers.service.OfferService;
+import com.tripbus.flashoffers.service.ReservationRateLimiter;
 import com.tripbus.flashoffers.web.dto.CreateOfferRequest;
 import com.tripbus.flashoffers.web.dto.OfferResponse;
 import com.tripbus.flashoffers.web.dto.QuotaResponse;
@@ -37,11 +38,15 @@ public class OfferController {
 
     private final OfferService offerService;
     private final RouteFollowService follows;
+    private final ReservationRateLimiter rateLimiter;
 
     @Autowired
-    public OfferController(OfferService offerService, RouteFollowService follows) {
-        this.offerService = offerService; this.follows=follows;
+    public OfferController(OfferService offerService, RouteFollowService follows, ReservationRateLimiter rateLimiter) {
+        this.offerService = offerService;
+        this.follows = follows;
+        this.rateLimiter = rateLimiter;
     }
+    public OfferController(OfferService offerService, RouteFollowService follows) { this(offerService, follows, null); }
     /** Constructor conservado para las pruebas y adaptadores existentes. */
     public OfferController(OfferService offerService) { this(offerService, null); }
 
@@ -101,7 +106,12 @@ public class OfferController {
     @PostMapping("/{id}/reservations")
     public ResponseEntity<ReservationResponse> reserve(@PathVariable UUID id, @Valid @RequestBody ReserveRequest request,
                                                        Authentication authentication) {
-        OfferService.ReserveResult result = offerService.reserve(id, CurrentUser.id(authentication), request.docId());
+        UUID userId = CurrentUser.id(authentication);
+        // US-168: máximo de intentos por usuario y minuto (429 con Retry-After).
+        if (rateLimiter != null) {
+            rateLimiter.check(userId);
+        }
+        OfferService.ReserveResult result = offerService.reserve(id, userId, request.docId());
         return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK).body(result.reservation());
     }
 

@@ -2,6 +2,7 @@ package com.tripbus.flashoffers.common.error;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -28,8 +29,11 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
-        return ResponseEntity.status(ex.getStatus())
-                .body(ErrorResponse.of(ex.getCode(), ex.getMessage(), ex.getDetails()));
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(ex.getStatus());
+        if (ex instanceof TooManyRequestsException tooMany) {
+            response.header(HttpHeaders.RETRY_AFTER, String.valueOf(tooMany.getRetryAfterSeconds()));
+        }
+        return response.body(ErrorResponse.of(ex.getCode(), ex.getMessage(), ex.getDetails()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

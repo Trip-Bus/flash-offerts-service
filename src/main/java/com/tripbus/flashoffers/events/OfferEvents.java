@@ -10,6 +10,9 @@ public final class OfferEvents {
     public static final String OFFER_UPDATED = "OfferUpdated";
     public static final String OFFER_QUOTA_UPDATED = "OfferQuotaUpdated";
     public static final String OFFER_ALERT = "OfferAlert";
+    // US-162: sala de espera (los difunde el Realtime Gateway).
+    public static final String OFFER_QUEUE_ADMITTED = "OfferQueueAdmitted";
+    public static final String OFFER_QUEUE_UPDATED = "OfferQueueUpdated";
 
     // Consume
     public static final String SEAT_SOLD = "SeatSold";
