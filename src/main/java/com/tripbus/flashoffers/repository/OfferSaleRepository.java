@@ -28,4 +28,8 @@ public interface OfferSaleRepository extends JpaRepository<OfferSale, UUID> {
     List<OfferSale> findByOfferIdAndEstadoIn(UUID offerId, Collection<SaleStatus> estados);
 
     long countByOfferIdAndUserIdAndEstadoIn(UUID offerId, UUID userId, Collection<SaleStatus> estados);
+
+    /** US-168: reservas vivas de un documento desde el inicio del día, en todas las ofertas. */
+    long countByDocIdAndEstadoInAndCreadoEnGreaterThanEqual(String docId, Collection<SaleStatus> estados,
+                                                            java.time.Instant desde);
 }

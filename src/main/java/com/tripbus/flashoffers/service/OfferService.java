@@ -6,6 +6,7 @@ import com.tripbus.flashoffers.common.error.ApiException;
 import com.tripbus.flashoffers.common.events.EventPublisher;
 import com.tripbus.flashoffers.domain.Offer;
 import com.tripbus.flashoffers.domain.OfferSale;
+import com.tripbus.flashoffers.domain.OfferSource;
 import com.tripbus.flashoffers.domain.OfferStatus;
 import com.tripbus.flashoffers.domain.SaleStatus;
 import com.tripbus.flashoffers.events.OfferEvents;
@@ -33,6 +34,10 @@ import java.time.Clock;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -69,6 +74,24 @@ public class OfferService {
     private final Clock clock;
     @Value("${tripbus.offers.min-discount:5}") private BigDecimal minDiscount = BigDecimal.valueOf(5);
     @Value("${tripbus.offers.max-discount:70}") private BigDecimal maxDiscount = BigDecimal.valueOf(70);
+    /** Rechazos por límite de la persona (por oferta o por documento al día): resultado limite_usuario. */
+    private static final Set<String> LIMIT_CODES = Set.of("USER_LIMIT_REACHED", "DOCUMENT_DAILY_LIMIT");
+    @Value("${tripbus.offers.max-per-document-per-day:2}") private int maxPerDocumentPerDay = 2;
+    @Value("${tripbus.offers.zone:America/Bogota}") private ZoneId zone = ZoneId.of("America/Bogota");
+    private OfferMeters meters;
+    private WaitingRoomService waitingRoom;
+
+    /** Métricas opcionales (HT-10): las pruebas unitarias construyen el servicio sin ellas. */
+    @Autowired(required = false)
+    public void setMeters(OfferMeters meters) {
+        this.meters = meters;
+    }
+
+    /** Sala de espera (US-162); opcional por la misma razón. */
+    @Autowired(required = false)
+    public void setWaitingRoom(WaitingRoomService waitingRoom) {
+        this.waitingRoom = waitingRoom;
+    }
 
     @Autowired
     public OfferService(OfferRepository offerRepository, OfferSaleRepository saleRepository, QuotaCounter quota,
@@ -95,11 +118,27 @@ public class OfferService {
     // ------------------------------------------------------------------ CreateOffer (US-054)
 
     public OfferResponse create(CreateOfferRequest request, UUID userId, boolean isOperator, UUID operatorCompanyId) {
-        return create(request,userId,isOperator,operatorCompanyId,false,false);
+        return create(request,userId,isOperator,operatorCompanyId,CreationMode.MANUAL);
+    }
+
+    /**
+     * US-167/US-169: oferta generada por una regla automática o una plantilla, con el mismo flujo y las mismas
+     * validaciones que crear (incluida la de empresa: el viaje debe ser de {@code companyId}). La crea el sistema.
+     */
+    public OfferResponse createGenerated(CreateOfferRequest request, UUID companyId, OfferSource source, UUID templateId) {
+        return create(request, null, true, companyId, new CreationMode(false, false, source, templateId));
+    }
+
+    /** Cómo se crea: duplicar exige el cupo completo (y puede elegir asientos); el origen va a la oferta. */
+    private record CreationMode(boolean requireFullQuota, boolean allowAutomaticSeats, OfferSource source,
+                                UUID templateId) {
+        static final CreationMode MANUAL = new CreationMode(false, false, OfferSource.MANUAL, null);
     }
 
     private OfferResponse create(CreateOfferRequest request, UUID userId, boolean isOperator, UUID operatorCompanyId,
-                                 boolean requireFullQuota, boolean allowAutomaticSeats) {
+                                 CreationMode mode) {
+        boolean requireFullQuota = mode.requireFullQuota();
+        boolean allowAutomaticSeats = mode.allowAutomaticSeats();
         Instant now = clock.instant();
         List<String> seats = request.seatNumbers().stream().map(String::trim).filter(s -> !s.isEmpty()).distinct().toList();
         if (!request.fin().isAfter(request.inicio())) {
@@ -138,13 +177,9 @@ public class OfferService {
                 request.inicio(), request.fin(), userId, now);
         draft.datosViaje(itinerary.companyId(), itinerary.origen(), itinerary.destino(), itinerary.fechaSalida(),
                 itinerary.precioBase(), itinerary.empresaNombre(), request.permiteReprogramar()==null || request.permiteReprogramar());
+        draft.origen(Boolean.TRUE.equals(request.salaEsperaHabilitada()), mode.source(), mode.templateId());
         // Se guarda como BORRADOR: el scheduler no la activa (ni se lista) hasta tener sus asientos reservados.
-        tx.executeWithoutResult(s -> {
-            jdbc.query("select pg_advisory_xact_lock(hashtext(?))", rs -> { }, "offer-itinerary:"+request.itineraryId());
-            if(!offerRepository.findOverlaps(request.itineraryId(),request.inicio(),request.fin(),OfferStatus.CERRADA).isEmpty())
-                throw ApiException.conflict("OFFER_OVERLAP", "Ya existe una oferta en una ventana que se cruza con este viaje");
-            offerRepository.save(draft);
-        });
+        saveDraft(draft);
 
         SeatInventoryClient.OfferSeats reserved;
         try {
@@ -185,6 +220,23 @@ public class OfferService {
             tx.executeWithoutResult(s -> activate(draft.getId()));
         }
         return tx.execute(s -> get(draft.getId()));
+    }
+
+    /** Guarda el borrador si no se cruza con otra oferta del viaje (lock asesor por viaje). */
+    private void saveDraft(Offer draft) {
+        UUID itineraryId = draft.getItineraryId();
+        try {
+            tx.executeWithoutResult(s -> {
+                jdbc.query("select pg_advisory_xact_lock(hashtext(?))", rs -> { }, "offer-itinerary:" + itineraryId);
+                if (!offerRepository.findOverlaps(itineraryId, draft.getInicio(), draft.getFin(), OfferStatus.CERRADA).isEmpty()) {
+                    throw ApiException.conflict("OFFER_OVERLAP", "Ya existe una oferta en una ventana que se cruza con este viaje");
+                }
+                offerRepository.saveAndFlush(draft);
+            });
+        } catch (DataIntegrityViolationException e) {
+            // Índices únicos: una oferta automática por viaje y una por plantilla y viaje (dos nodos a la vez).
+            throw ApiException.conflict("OFFER_ALREADY_GENERATED", "Ya se generó una oferta para este viaje");
+        }
     }
 
     /** Borrador -> PROGRAMADA con sus asientos, en la misma transacción que publica OfferCreated. */
@@ -261,6 +313,9 @@ public class OfferService {
         payload.put("origen", offer.getOrigen()); payload.put("destino", offer.getDestino());
         payload.put("timestamp", clock.instant());
         events.publishAfterCommit(OfferEvents.OFFER_ACTIVATED, payload);
+        if (meters != null) {
+            meters.activated(offer.getOrigenCreacion());
+        }
         if (alerts != null) alerts.alertAfterCommit(offer);
         events.publishAfterCommit(OfferEvents.OFFER_QUOTA_UPDATED, quotaPayload(offer.getId(), remaining(offer)));
     }
@@ -275,6 +330,7 @@ public class OfferService {
             return;
         }
         offer.cerrar(motivo);
+        closeWaitingRoomAfterCommit(offer);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("offerId", offer.getId());
         payload.put("itineraryId", offer.getItineraryId());
@@ -301,11 +357,12 @@ public class OfferService {
         }
         Instant now = clock.instant();
         if (offer.getEstado() == OfferStatus.AGOTADA) {
-            throw ApiException.conflict("OUT_OF_STOCK", "La oferta se agotó");
+            throw outOfStock();
         }
         if (offer.getEstado() != OfferStatus.ACTIVA || !offer.vigente(now)) {
             throw ApiException.conflict("OFFER_NOT_ACTIVE", "La oferta no está activa");
         }
+        requireTurn(offer, userId);
 
         try {
             if (!quota.isInitialized(offerId)) {
@@ -327,6 +384,9 @@ public class OfferService {
         } catch (RuntimeException e) {
             // Incluye un fallo del commit: el cupo y la retención ya tomados se devuelven.
             undo(offerId, attempt, "RESERVA_FALLIDA");
+            if (e instanceof ApiException api && LIMIT_CODES.contains(api.getCode())) {
+                count(OfferMeters.ReservationResult.LIMITE_USUARIO);
+            }
             throw e;
         }
         if (attempt.existing != null) {
@@ -334,7 +394,7 @@ public class OfferService {
         }
         if (attempt.soldOut) {
             markSoldOut(offerId);
-            throw ApiException.conflict("OUT_OF_STOCK", "La oferta se agotó");
+            throw outOfStock();
         }
 
         Integer remaining = quota.remaining(offerId);
@@ -342,7 +402,61 @@ public class OfferService {
         if (remaining != null && remaining <= 0) {
             markSoldOut(offerId);
         }
+        count(OfferMeters.ReservationResult.OK);
         return new ReserveResult(toReservation(Objects.requireNonNull(sale), offer), true);
+    }
+
+    /** US-162: con sala de espera solo reserva quien tiene un token de admisión vigente. */
+    private void requireTurn(Offer offer, UUID userId) {
+        if (offer.isSalaEsperaHabilitada() && waitingRoom != null && !waitingRoom.hasAdmission(offer.getId(), userId)) {
+            count(OfferMeters.ReservationResult.SIN_TURNO);
+            throw ApiException.forbidden("QUEUE_TURN_REQUIRED",
+                    "Esta oferta tiene sala de espera: necesita un turno de admisión vigente para reservar");
+        }
+    }
+
+    /**
+     * US-168: máximo de reservas vivas por documento en el día (zona de la plataforma), sumando todas las ofertas. Un
+     * lock asesor por documento serializa las reservas simultáneas del mismo documento en ofertas distintas.
+     */
+    private void checkDocumentLimit(String docId) {
+        jdbc.query("select pg_advisory_xact_lock(hashtext(?))", rs -> { }, "offer-doc:" + docId);
+        Instant startOfDay = LocalDate.now(clock.withZone(zone)).atStartOfDay(zone).toInstant();
+        if (saleRepository.countByDocIdAndEstadoInAndCreadoEnGreaterThanEqual(docId, VIVAS, startOfDay)
+                >= maxPerDocumentPerDay) {
+            throw new ApiException(HttpStatus.CONFLICT, "DOCUMENT_DAILY_LIMIT",
+                    "Ese documento ya tiene el máximo de reservas de oferta permitidas hoy",
+                    Map.of("maxPorDocumentoAlDia", maxPerDocumentPerDay));
+        }
+    }
+
+    /** US-162: la sala se cierra cuando la oferta se agota o termina (después del commit, sin lanzar). */
+    private void closeWaitingRoomAfterCommit(Offer offer) {
+        if (waitingRoom == null || !offer.isSalaEsperaHabilitada()) {
+            return;
+        }
+        UUID offerId = offer.getId();
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    waitingRoom.close(offerId);
+                }
+            });
+        } else {
+            waitingRoom.close(offerId);
+        }
+    }
+
+    private ApiException outOfStock() {
+        count(OfferMeters.ReservationResult.AGOTADA);
+        return ApiException.conflict("OUT_OF_STOCK", "La oferta se agotó");
+    }
+
+    private void count(OfferMeters.ReservationResult result) {
+        if (meters != null) {
+            meters.reservation(result);
+        }
     }
 
     /** Lo que la transacción de reserva tomó fuera de la BD (para deshacerlo si falla) y cómo terminó. */
@@ -371,6 +485,7 @@ public class OfferService {
                     "Ya tiene el máximo de cupos permitido por persona en esta oferta",
                     Map.of("maxPorUsuario", offer.getMaxPorUsuario()));
         }
+        checkDocumentLimit(docId);
         try {
             attempt.seat = quota.reserve(offerId);
         } catch (DataAccessException e) {
@@ -403,6 +518,7 @@ public class OfferService {
         tx.executeWithoutResult(s -> offerRepository.lockById(offerId).ifPresent(o -> {
             if (o.getEstado() == OfferStatus.ACTIVA) {
                 o.agotar(clock.instant());
+                closeWaitingRoomAfterCommit(o);
                 events.publishAfterCommit(OfferEvents.OFFER_SOLD_OUT,
                         Map.of("offerId", offerId, "itineraryId", o.getItineraryId(), "origen",Objects.toString(o.getOrigen(),""),"destino",Objects.toString(o.getDestino(),""), "timestamp", clock.instant()));
             }
@@ -602,7 +718,10 @@ public class OfferService {
         List<String> oldSeats=List.copyOf(offer.getAsientos());
         if(changed){ seatInventory.releaseOfferSeats(id); try { var reserve=seatInventory.reserveOfferSeats(id,offer.getItineraryId(),seats); if(reserve==null||reserve.reservados()==null||reserve.reservados().size()<quotaCount) throw ApiException.conflict("NO_SEATS_AVAILABLE","No se pudieron reservar los asientos nuevos"); seats=reserve.reservados(); } catch(RuntimeException ex){ try{seatInventory.releaseOfferSeats(id);seatInventory.reserveOfferSeats(id,offer.getItineraryId(),oldSeats);}catch(RuntimeException ignored){} throw ex; } }
         List<String> chosen=seats;
-        try { tx.executeWithoutResult(s->{Offer locked=offerRepository.lockById(id).orElseThrow(); if(locked.getEstado()!=OfferStatus.PROGRAMADA||!locked.getInicio().isAfter(clock.instant()))throw ApiException.conflict("OFFER_NOT_EDITABLE","Oferta no editable"); locked.editar(precio,quotaCount,maxUser,inicio,fin,chosen,req.permiteReprogramar()==null?locked.isPermiteReprogramar():req.permiteReprogramar()); }); }
+        try { tx.executeWithoutResult(s->{Offer locked=offerRepository.lockById(id).orElseThrow(); if(locked.getEstado()!=OfferStatus.PROGRAMADA||!locked.getInicio().isAfter(clock.instant()))throw ApiException.conflict("OFFER_NOT_EDITABLE","Oferta no editable"); locked.editar(precio,quotaCount,maxUser,inicio,fin,chosen,req.permiteReprogramar()==null?locked.isPermiteReprogramar():req.permiteReprogramar());
+            if (req.salaEsperaHabilitada() != null) {
+                locked.habilitarSalaEspera(req.salaEsperaHabilitada());
+            } }); }
         catch(RuntimeException ex){if(changed)try{seatInventory.releaseOfferSeats(id);seatInventory.reserveOfferSeats(id,offer.getItineraryId(),oldSeats);}catch(RuntimeException ignored){}throw ex;}
         if(changed && quota.isInitialized(id)){quota.delete(id);quota.initialize(id,quotaCount,chosen);}
         Map<String,Object> event=new LinkedHashMap<>(); event.put("offerId",id);event.put("itineraryId",offer.getItineraryId());event.put("origen",offer.getOrigen());event.put("destino",offer.getDestino());event.put("precioOferta",precio);event.put("timestamp",now);events.publishSafely(OfferEvents.OFFER_UPDATED,event);
@@ -615,7 +734,8 @@ public class OfferService {
         CatalogClient.Itinerary target=catalog.itinerary(req.itineraryId()); if(!Objects.equals(original.getCompanyId(),target.companyId()))throw ApiException.notFound("ITINERARY_NOT_FOUND","El itinerario no existe"); checkCompanyId(target.companyId(),company,admin);
         BigDecimal price=target.precioBase().multiply(original.getPrecioOferta()).divide(original.getPrecioBase(),2,java.math.RoundingMode.HALF_UP);
         List<String> seats=req.seatNumbers()==null?original.getAsientos():req.seatNumbers();
-        return create(new CreateOfferRequest(req.itineraryId(),seats,price,original.getCupoMax(),req.inicio(),req.fin(),original.getMaxPorUsuario(),original.isPermiteReprogramar()),userId,false,company,true,req.seatNumbers()==null);
+        return create(new CreateOfferRequest(req.itineraryId(),seats,price,original.getCupoMax(),req.inicio(),req.fin(),original.getMaxPorUsuario(),original.isPermiteReprogramar(),original.isSalaEsperaHabilitada()),userId,false,company,
+                new CreationMode(true,req.seatNumbers()==null,OfferSource.MANUAL,null));
     }
 
     private void checkCompany(Offer o, UUID company, boolean admin){if(!admin&&!Objects.equals(company,o.getCompanyId()))throw ApiException.notFound("OFFER_NOT_FOUND","La oferta no existe");}
@@ -712,7 +832,8 @@ public class OfferService {
     private OfferResponse toResponse(Offer offer) {
         return new OfferResponse(offer.getId(), offer.getItineraryId(), offer.getPrecioOferta(), offer.getCupoMax(),
                 offer.getMaxPorUsuario(), remaining(offer), offer.getInicio(), offer.getFin(), offer.getEstado().name(), secondsLeft(offer),
-                List.copyOf(offer.getAsientos()), offer.getMotivoCierre(),offer.isPermiteReprogramar());
+                List.copyOf(offer.getAsientos()), offer.getMotivoCierre(),offer.isPermiteReprogramar(),
+                offer.isSalaEsperaHabilitada(), offer.getOrigenCreacion().name());
     }
 
     private static ReservationResponse toReservation(OfferSale sale, Offer offer) {
