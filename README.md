@@ -146,15 +146,15 @@ rama de trabajo --PR--> develop (QA) --PR de release--> main (PROD)
 |---|---|---|---|
 | PR con base `develop` | ✔ | ✔ (quality gate) | no |
 | push a `develop` (merge de un PR) | ✔ | ✔ (quality gate) | `:qa`, `:develop`, `:sha-<corto>` |
-| PR con base `main` (release) | ✔ | — | no |
-| push a `main` (merge del release) | ✔ | — | `:prod`, `:latest`, `:sha-<corto>` |
-| `workflow_dispatch` | ✔ | solo si se lanza sobre `develop` | no |
+| PR con base `main` (release) | ✔ | ✔ (quality gate) | no |
+| push a `main` (merge del release) | ✔ | ✔ (quality gate) | `:prod`, `:latest`, `:sha-<corto>` |
+| `workflow_dispatch` | ✔ | solo si se lanza sobre `develop` o `main` | no |
 
-**Por qué Sonar solo corre en `develop`:** el plan Free de SonarQube Cloud analiza una única rama,
-y la rama principal del proyecto en Sonar es `develop`. Lo que llega a `main` es exactamente el
-código que ya pasó el quality gate en `develop`, así que en `main` el CI hace `mvn verify` sin Sonar
-y lo indica con un aviso (`::notice::`). El control de cobertura de JaCoCo (`jacoco:check`) sí corre
-en todas las ramas.
+**Por qué Sonar corre también en `main`:** la rama principal del proyecto en SonarQube Cloud es
+`main`, y su último análisis es el que muestra el dashboard (ratings globales de seguridad y
+fiabilidad, cobertura). Si `main` no se analiza, el dashboard se queda con un análisis viejo aunque
+`develop` esté en A. `develop` se analiza como rama secundaria (el proyecto es público, el análisis
+de ramas no tiene costo). El control de cobertura de JaCoCo (`jacoco:check`) corre en todas las ramas.
 
 **Cómo hacer un release:**
 
@@ -309,7 +309,7 @@ Toda la plataforma: ver el README de **API-gateway**.
 ### Cobertura mínima (JaCoCo)
 
 `mvn verify` falla si la cobertura total baja de los mínimos del `pom.xml`, en **todas** las ramas
-(también en `main`, donde Sonar no corre):
+(también en `main`):
 
 | Métrica | Medido (2026-11-05, sprints 5 y 6) | Mínimo |
 |---|---|---|
@@ -339,7 +339,7 @@ corrigen en Spring Framework 7; este servicio no usa `XsltView` ni expone SSE); 
 vuelve a fallar si no se migró a Spring Boot 4.1. Lo que sí tiene parche nunca se agrega aquí: se
 corrige subiendo la versión (ver las propiedades `*.version` de parches de seguridad en `pom.xml`).
 
-El análisis de Sonar solo corre en `develop` (push y PR con base `develop`, ver
+El análisis de Sonar corre en `develop` y `main` (push y PR con base en ellas, ver
 [Flujo de ramas y entornos](#flujo-de-ramas-y-entornos)) y si el repo tiene el secreto `SONAR_TOKEN`;
 en otro caso el CI hace `mvn verify` y deja un aviso.
 

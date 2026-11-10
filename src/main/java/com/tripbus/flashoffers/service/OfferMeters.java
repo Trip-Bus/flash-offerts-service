@@ -52,7 +52,7 @@ public class OfferMeters {
     private final MeterRegistry registry;
     private final OfferRepository offers;
     private final QuotaCounter quota;
-    private final MultiGauge remaining;
+    private final MultiGauge remainingGauge;
 
     public OfferMeters(MeterRegistry registry, OfferRepository offers, QuotaCounter quota) {
         this.registry = registry;
@@ -65,7 +65,7 @@ public class OfferMeters {
         for (OfferSource s : OfferSource.values()) {
             activatedCounter(s);
         }
-        this.remaining = MultiGauge.builder(REMAINING)
+        this.remainingGauge = MultiGauge.builder(REMAINING)
                 .description("Cupo restante de cada oferta activa")
                 .register(registry);
     }
@@ -103,7 +103,7 @@ public class OfferMeters {
                     rows.add(MultiGauge.Row.of(Tags.of("offerId", id.toString()), Math.max(0, left)));
                 }
             }
-            remaining.register(rows, true);
+            remainingGauge.register(rows, true);
         } catch (RuntimeException e) {
             log.debug("No se pudo refrescar el gauge de cupo: {}", e.getMessage());
         }
