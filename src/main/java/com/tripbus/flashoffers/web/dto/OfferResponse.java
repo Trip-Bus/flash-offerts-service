@@ -10,11 +10,21 @@ public record OfferResponse(
         UUID itineraryId,
         BigDecimal precioOferta,
         int cupoMax,
+        int maxPorUsuario,
         int cupoRestante,
         Instant inicio,
         Instant fin,
         String estado,
         long segundosRestantes,
         List<String> asientos,
-        String motivoCierre) {
+        String motivoCierre,
+        boolean permiteReprogramar,
+        boolean salaEsperaHabilitada,
+        String origenCreacion) {
+    public OfferResponse(UUID offerId, UUID itineraryId, BigDecimal precioOferta, int cupoMax, int maxPorUsuario,
+                         int cupoRestante, Instant inicio, Instant fin, String estado, long segundosRestantes,
+                         List<String> asientos, String motivoCierre) {
+        this(offerId,itineraryId,precioOferta,cupoMax,maxPorUsuario,cupoRestante,inicio,fin,estado,segundosRestantes,
+                asientos,motivoCierre,true,false,"MANUAL");
+    }
 }

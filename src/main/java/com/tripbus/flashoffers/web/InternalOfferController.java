@@ -24,4 +24,7 @@ public class InternalOfferController {
     public ReservationResponse byHold(@PathVariable UUID offerId, @PathVariable UUID holdId) {
         return offerService.reservationByHold(offerId, holdId);
     }
+
+    @GetMapping("/{offerId}")
+    public java.util.Map<String,Object> details(@PathVariable UUID offerId) { return offerService.internalDetails(offerId); }
 }

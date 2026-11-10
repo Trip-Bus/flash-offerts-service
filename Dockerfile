@@ -7,7 +7,10 @@ COPY src ./src
 RUN mvn -B -q package -DskipTests
 
 # ---- Etapa 2: imagen de ejecución (solo JRE) ----
-FROM eclipse-temurin:21-jre-alpine
+# El CI la reconstruye siempre sin caché (no-cache-filters: runtime) para que apk upgrade
+# traiga los parches de seguridad de Alpine publicados después del último build.
+FROM eclipse-temurin:21-jre-alpine AS runtime
+RUN apk upgrade --no-cache
 RUN addgroup -S tripbus && adduser -S tripbus -G tripbus
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar

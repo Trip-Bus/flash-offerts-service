@@ -6,10 +6,12 @@
 #   - main    = PROD: cada push publica la imagen con los tags  prod, latest, sha-<corto>.
 #   - Los PR y workflow_dispatch compilan, prueban y escanean, pero no publican.
 #
-# SonarQube Cloud solo corre en develop (push a develop y PR con base develop):
-#   - el plan Free analiza una única rama, y la rama principal del proyecto en Sonar es "develop";
-#   - lo que llega a main es el mismo código que ya pasó el quality gate en develop.
-#   En main (push, PR hacia main, workflow_dispatch) se ejecuta mvn verify sin Sonar.
+# SonarQube Cloud corre en develop y en main (push a esas ramas y PR con base en ellas):
+#   - la rama principal del proyecto en Sonar es "main": su análisis es el que muestra el dashboard
+#     (ratings de seguridad/fiabilidad y cobertura globales), así que debe actualizarse en cada release;
+#     si main no se analiza, el dashboard se queda con un análisis viejo aunque develop esté en A;
+#   - develop se analiza como rama secundaria (el proyecto es público: el análisis de ramas es gratis).
+#   En workflow_dispatch sobre otras ramas se ejecuta mvn verify sin Sonar.
 #
 # Jobs:
 #   secretos   -> Gitleaks sobre todo el historial git.
@@ -17,7 +19,7 @@
 #                 FlashOfferQuotaIT: 1.000 reservas concurrentes con cupo 20 -> exactamente 20 ventas, es un gate),
 #                 cobertura JaCoCo con control jacoco:check (en TODAS las ramas, también en main: el build
 #                 falla si la cobertura baja de los mínimos del pom), resumen de cobertura en la ejecución
-#                 y, en develop con SONAR_TOKEN, análisis + quality gate en SonarQube Cloud.
+#                 y, en develop y main con SONAR_TOKEN, análisis + quality gate en SonarQube Cloud.
 #   docker     -> construye la imagen, la escanea con Trivy (siempre) y, solo en push, la publica en GHCR.
 #
 # Login a Docker Hub (secretos DOCKERHUB_USERNAME y DOCKERHUB_TOKEN, token de solo lectura):
@@ -80,8 +82,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      # 'true' solo en push a develop o en PR con base develop (la única rama que analiza Sonar).
-      SONAR_APLICA: ${{ github.ref == 'refs/heads/develop' || github.base_ref == 'develop' }}
+      # 'true' en push a develop/main o en PR con base develop/main (las ramas que analiza Sonar).
+      SONAR_APLICA: ${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || github.base_ref == 'develop' || github.base_ref == 'main' }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
@@ -117,11 +119,7 @@ jobs:
         if: env.SONAR_TOKEN == '' || env.SONAR_APLICA != 'true'
         run: |
           if [ "$SONAR_APLICA" != "true" ]; then
-            if [ "$GITHUB_REF" = "refs/heads/main" ] || [ "$GITHUB_BASE_REF" = "main" ]; then
-              echo "::notice::main/PROD: Sonar no aplica; el código ya pasó el quality gate en develop."
-            else
-              echo "::notice::Sonar solo se ejecuta en push a develop y en PR con base develop (plan Free: una sola rama)."
-            fi
+            echo "::notice::Sonar solo se ejecuta en push a develop/main y en PR con base develop/main."
           else
             echo "::warning::Falta configurar el secreto SONAR_TOKEN: se omite el análisis de SonarQube Cloud."
           fi
@@ -217,14 +215,21 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Primero se construye y se carga en el Docker local (sin publicar) para escanearla.
+      # pull + no-cache-filters: la etapa runtime (base JRE + apk upgrade) nunca sale de la caché gha;
+      # si saliera, apk upgrade quedaría congelado en un build viejo y Trivy fallaría por parches de
+      # Alpine ya publicados (brotli, expat, musl...). La etapa Maven sí se sigue cacheando.
       - name: Construir imagen
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
           push: false
+          pull: true
+          no-cache-filters: runtime
           build-args: GIT_COMMIT=${{ github.sha }}
-          tags: flash-offerts-service:ci
+          tags: |
+            flash-offerts-service:ci
+            ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -249,14 +254,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Mismo build (sale de la caché) pero publicando con los tags definitivos.
+      # Se publica exactamente la imagen que escaneó Trivy (ya tiene los tags definitivos), sin reconstruir.
       - name: Publicar imagen
         if: github.event_name == 'push'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          push: true
-          build-args: GIT_COMMIT=${{ github.sha }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "$TAGS" | while read -r tag; do
+            if [ -n "$tag" ]; then docker push "$tag"; fi
+          done

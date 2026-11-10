@@ -5,6 +5,7 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -54,6 +55,23 @@ public class QuotaCounter {
             return 1
             """, Long.class);
 
+    // Corrección de la reconciliación: solo si el contador sigue con el valor observado (nadie reservó ni devolvió
+    // entretanto); deja el cupo esperado y reconstruye la lista con los asientos libres reales.
+    private static final RedisScript<Long> CORRECT = new DefaultRedisScript<>("""
+            if redis.call('EXISTS', KEYS[3]) == 0 then
+              return 0
+            end
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+              return 0
+            end
+            redis.call('SET', KEYS[1], ARGV[2])
+            redis.call('DEL', KEYS[2])
+            for i = 3, #ARGV do
+              redis.call('RPUSH', KEYS[2], ARGV[i])
+            end
+            return 1
+            """, Long.class);
+
     private final StringRedisTemplate redis;
 
     public QuotaCounter(StringRedisTemplate redis) {
@@ -70,6 +88,10 @@ public class QuotaCounter {
 
     static String initKey(UUID offerId) {
         return "offer:{" + offerId + "}:init";
+    }
+
+    static String mismatchKey(UUID offerId) {
+        return "offer:{" + offerId + "}:mismatch";
     }
 
     private static List<String> keys(UUID offerId) {
@@ -105,6 +127,34 @@ public class QuotaCounter {
     }
 
     public void delete(UUID offerId) {
-        redis.delete(keys(offerId));
+        List<String> all = new ArrayList<>(keys(offerId));
+        all.add(mismatchKey(offerId));
+        redis.delete(all);
+    }
+
+    /**
+     * Reconciliación: pone el cupo en {@code nuevo} y la lista de asientos en {@code asientosLibres}, solo si el
+     * contador sigue valiendo {@code observado}. Devuelve false si cambió entretanto o la oferta no tiene contador.
+     */
+    public boolean correct(UUID offerId, int observado, int nuevo, Collection<String> asientosLibres) {
+        List<String> args = new ArrayList<>();
+        args.add(String.valueOf(observado));
+        args.add(String.valueOf(Math.max(0, nuevo)));
+        args.addAll(asientosLibres);
+        Long result = redis.execute(CORRECT, keys(offerId), args.toArray());
+        return result != null && result == 1;
+    }
+
+    /** Desajuste visto en la revisión anterior de la reconciliación ("esperado:redis"), o null. */
+    public String lastMismatch(UUID offerId) {
+        return redis.opsForValue().get(mismatchKey(offerId));
+    }
+
+    public void rememberMismatch(UUID offerId, String mismatch, Duration ttl) {
+        redis.opsForValue().set(mismatchKey(offerId), mismatch, ttl);
+    }
+
+    public void forgetMismatch(UUID offerId) {
+        redis.delete(mismatchKey(offerId));
     }
 }

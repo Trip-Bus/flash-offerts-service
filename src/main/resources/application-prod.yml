@@ -3,6 +3,11 @@ logging:
   level:
     com.tripbus: INFO
 
+# En PROD los logs siguen saliendo en JSON (ECS) salvo que LOG_FORMAT diga otra cosa.
+tripbus:
+  logging:
+    format: ${LOG_FORMAT:json}
+
 # Swagger/OpenAPI apagado en producción (solo IDE y QA).
 springdoc:
   api-docs:

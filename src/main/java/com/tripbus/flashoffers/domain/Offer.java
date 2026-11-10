@@ -22,17 +22,32 @@ import java.util.UUID;
 @Table(name = "offers")
 public class Offer {
 
+    /** US-058: máximo por persona cuando la oferta no indica otro (o el cupo, si es menor). */
+    public static final int DEFAULT_MAX_POR_USUARIO = 2;
+
     @Id
     private UUID id;
 
     @Column(name = "itinerary_id", nullable = false)
     private UUID itineraryId;
 
+    @Column(name = "company_id") private UUID companyId;
+    private String origen;
+    private String destino;
+    @Column(name = "fecha_salida") private Instant fechaSalida;
+    @Column(name = "precio_base") private BigDecimal precioBase;
+    @Column(name = "empresa_nombre") private String empresaNombre;
+    @Column(name = "permite_reprogramar", nullable = false) private boolean permiteReprogramar = true;
+
     @Column(name = "precio_oferta", nullable = false)
     private BigDecimal precioOferta;
 
     @Column(name = "cupo_max", nullable = false)
     private int cupoMax;
+
+    /** US-058: cupos que una misma persona (userId) puede tomar en la oferta, sumando todos sus documentos. */
+    @Column(name = "max_por_usuario", nullable = false)
+    private int maxPorUsuario;
 
     @Column(nullable = false)
     private Instant inicio;
@@ -53,6 +68,22 @@ public class Offer {
     @Column(name = "creado_en", nullable = false)
     private Instant creadoEn;
 
+    @Column(name = "agotada_en")
+    private Instant agotadaEn;
+
+    /** US-162: con sala de espera, reservar exige un token de admisión vigente. */
+    @Column(name = "sala_espera_habilitada", nullable = false)
+    private boolean salaEsperaHabilitada;
+
+    /** US-167/US-169: MANUAL, AUTOMATICA (regla de baja ocupación) o RECURRENTE (plantilla). */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "origen_creacion", nullable = false)
+    private OfferSource origenCreacion = OfferSource.MANUAL;
+
+    /** US-169: plantilla que generó la oferta (idempotencia por plantilla y viaje). */
+    @Column(name = "template_id")
+    private UUID templateId;
+
     @ElementCollection(fetch = FetchType.LAZY)
     @CollectionTable(name = "offer_seats", joinColumns = @JoinColumn(name = "offer_id"))
     @Column(name = "seat_number", nullable = false)
@@ -66,10 +97,17 @@ public class Offer {
 
     public Offer(UUID itineraryId, BigDecimal precioOferta, int cupoMax, Instant inicio, Instant fin, UUID creadoPor,
                  Instant now) {
+        this(itineraryId, precioOferta, cupoMax, Math.min(DEFAULT_MAX_POR_USUARIO, cupoMax), inicio, fin, creadoPor,
+                now);
+    }
+
+    public Offer(UUID itineraryId, BigDecimal precioOferta, int cupoMax, int maxPorUsuario, Instant inicio, Instant fin,
+                 UUID creadoPor, Instant now) {
         this.id = UUID.randomUUID();
         this.itineraryId = itineraryId;
         this.precioOferta = precioOferta;
         this.cupoMax = cupoMax;
+        this.maxPorUsuario = maxPorUsuario;
         this.inicio = inicio;
         this.fin = fin;
         this.creadoPor = creadoPor;
@@ -86,6 +124,10 @@ public class Offer {
         this.asientos.addAll(asientos);
         if (cupoMax > asientos.size()) {
             cupoMax = asientos.size();
+        }
+        // ck_offers_max_por_usuario: el máximo por persona nunca supera el cupo.
+        if (maxPorUsuario > cupoMax) {
+            maxPorUsuario = cupoMax;
         }
     }
 
@@ -107,8 +149,9 @@ public class Offer {
         }
     }
 
-    public void agotar() {
+    public void agotar(Instant now) {
         this.estado = OfferStatus.AGOTADA;
+        this.agotadaEn = now;
     }
 
     public void reabrir() {
@@ -119,6 +162,46 @@ public class Offer {
         this.estado = OfferStatus.CERRADA;
         this.motivoCierre = motivo;
     }
+
+    public void datosViaje(UUID companyId, String origen, String destino, Instant salida, BigDecimal base,
+                           String empresa, boolean permiteReprogramar) {
+        this.companyId = companyId; this.origen = origen; this.destino = destino; this.fechaSalida = salida;
+        this.precioBase = base; this.empresaNombre = empresa; this.permiteReprogramar = permiteReprogramar;
+    }
+
+    public void editar(BigDecimal precio, int cupo, int maxUsuario, Instant inicio, Instant fin,
+                       List<String> seats, boolean reprogramar) {
+        this.precioOferta=precio; this.cupoMax=cupo; this.maxPorUsuario=maxUsuario;
+        this.inicio=inicio; this.fin=fin; this.permiteReprogramar=reprogramar;
+        this.asientos.clear(); this.asientos.addAll(seats);
+    }
+    /** Cómo nace la oferta: sala de espera, origen y plantilla (solo al crearla). */
+    public void origen(boolean salaEspera, OfferSource origen, UUID plantilla) {
+        this.salaEsperaHabilitada = salaEspera;
+        this.origenCreacion = origen != null ? origen : OfferSource.MANUAL;
+        this.templateId = plantilla;
+    }
+
+    public void habilitarSalaEspera(boolean habilitada) {
+        this.salaEsperaHabilitada = habilitada;
+    }
+
+    public boolean isSalaEsperaHabilitada() {
+        return salaEsperaHabilitada;
+    }
+
+    public OfferSource getOrigenCreacion() {
+        return origenCreacion;
+    }
+
+    public UUID getTemplateId() {
+        return templateId;
+    }
+
+    public void reprogramarViaje(Instant salida) { this.fechaSalida=salida; if (fin.isAfter(salida)) this.fin=salida; }
+    public UUID getCompanyId(){return companyId;} public String getOrigen(){return origen;} public String getDestino(){return destino;}
+    public Instant getFechaSalida(){return fechaSalida;} public BigDecimal getPrecioBase(){return precioBase;}
+    public String getEmpresaNombre(){return empresaNombre;} public boolean isPermiteReprogramar(){return permiteReprogramar;}
 
     public UUID getId() {
         return id;
@@ -136,6 +219,10 @@ public class Offer {
         return cupoMax;
     }
 
+    public int getMaxPorUsuario() {
+        return maxPorUsuario;
+    }
+
     public Instant getInicio() {
         return inicio;
     }
@@ -143,6 +230,7 @@ public class Offer {
     public Instant getFin() {
         return fin;
     }
+    public Instant getAgotadaEn() { return agotadaEn; }
 
     public OfferStatus getEstado() {
         return estado;
